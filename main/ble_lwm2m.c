@@ -18,13 +18,12 @@
 
 static const char *TAG = "ble_lwm2m";
 
-// Advertising handles
-#define EXT_ADV_HANDLE          0   // Non-connectable periodic/broadcast set
-#define CONN_ADV_HANDLE         1   // Connectable advertising for GATT characteristic
-#define NUM_EXT_ADV             2
+// Single advertising handle
+#define EXT_ADV_HANDLE          0
+#define NUM_EXT_ADV             1
 
 // Separate variable for handle so we can take its address when stopping
-static uint8_t ext_adv_handle = EXT_ADV_HANDLE; // kept for stop API (broadcast set only)
+static uint8_t ext_adv_handle = EXT_ADV_HANDLE; // for stop API
 
 // Static variables for BLE state
 static lwm2m_FactoryPartition g_factory_partition = {0};
@@ -41,7 +40,8 @@ static bool ble_lwm2m_check_aes_key(uint32_t *boot_count_out);
 
 // Extended advertising parameters for periodic broadcasting
 static esp_ble_gap_ext_adv_params_t ext_adv_params = {
-    .type = ESP_BLE_GAP_SET_EXT_ADV_PROP_NONCONN_NONSCANNABLE_UNDIRECTED,
+    // Make the single advertising set CONNECTABLE so GATT characteristic is accessible.
+    .type = ESP_BLE_GAP_SET_EXT_ADV_PROP_CONNECTABLE,
     .interval_min = 0x20,  // ~20ms interval
     .interval_max = 0x20,
     .channel_map = ADV_CHNL_ALL,
@@ -55,26 +55,9 @@ static esp_ble_gap_ext_adv_params_t ext_adv_params = {
     .tx_power = EXT_ADV_TX_PWR_NO_PREFERENCE,
 };
 
-// Connectable (legacy) advertising params for GATT service access
-static esp_ble_gap_ext_adv_params_t conn_adv_params = {
-    // Extended connectable advertising (NOT scannable; connectable+scannable would force legacy PDUs per spec)
-    .type = ESP_BLE_GAP_SET_EXT_ADV_PROP_CONNECTABLE,
-    .interval_min = 0x40,
-    .interval_max = 0x40,
-    .channel_map = ADV_CHNL_ALL,
-    .filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY,
-    .primary_phy = ESP_BLE_GAP_PHY_1M,
-    .max_skip = 0,
-    .secondary_phy = ESP_BLE_GAP_PHY_1M,
-    .sid = 1,
-    .scan_req_notif = false,
-    .own_addr_type = BLE_ADDR_TYPE_RANDOM,
-    .tx_power = EXT_ADV_TX_PWR_NO_PREFERENCE,
-};
 
 static esp_ble_gap_ext_adv_t ext_adv[NUM_EXT_ADV] = {
-    [0] = {EXT_ADV_HANDLE, 0, 0},      // broadcast set
-    [1] = {CONN_ADV_HANDLE, 0, 0},     // connectable set
+    [0] = {EXT_ADV_HANDLE, 0, 0},
 };
 
 /* ---------------- GATT Service / Characteristic (Read/Write) ---------------- */
@@ -201,8 +184,8 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
         break;
     case ESP_GATTS_DISCONNECT_EVT:
         ESP_LOGI(TAG, "Client disconnected (reason=0x%x)", param->disconnect.reason);
-        // Ensure connectable advertising keeps running for new connections
-        esp_ble_gap_ext_adv_start(1, &ext_adv[1]);
+    // Restart advertising for next connection
+    esp_ble_gap_ext_adv_start(1, &ext_adv[0]);
         break;
     default:
         break;
@@ -235,17 +218,7 @@ static esp_err_t stop_extended_advertising(void) {
 
 // Start the connectable advertising set (GATT access). This runs continuously and is not
 // stopped during periodic broadcast data updates.
-static esp_err_t start_connectable_advertising(void) {
-    // Start only the connectable adv set
-    esp_err_t ret = esp_ble_gap_ext_adv_start(1, &ext_adv[1]);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to start connectable advertising: %s", esp_err_to_name(ret));
-        return ret;
-    }
-    // Wait for start complete (reuse semaphore)
-    xSemaphoreTake(ble_sem, portMAX_DELAY);
-    return ESP_OK;
-}
+// (Removed separate connectable advertising; single set now used for both broadcast data updates and GATT.)
 
 static void broadcast_task(void* param) {
     uint32_t boot_count;
@@ -363,37 +336,30 @@ esp_err_t ble_lwm2m_init(void) {
         return ESP_ERR_NO_MEM;
     }
     
-    // Create random addresses for both advertising sets
-    esp_bd_addr_t rand_addr_broadcast;
-    esp_ble_gap_addr_create_static(rand_addr_broadcast);
-    ESP_LOG_BUFFER_HEX(TAG, rand_addr_broadcast, ESP_BD_ADDR_LEN);
-    esp_bd_addr_t rand_addr_conn;
-    esp_ble_gap_addr_create_static(rand_addr_conn);
-    
-    // Configure broadcast (non-connectable) set
+    // Create random address for single advertising set
+    esp_bd_addr_t rand_addr_single;
+    esp_ble_gap_addr_create_static(rand_addr_single);
+    ESP_LOG_BUFFER_HEX(TAG, rand_addr_single, ESP_BD_ADDR_LEN);
     FUNC_SEND_WAIT_SEM(esp_ble_gap_ext_adv_set_params(EXT_ADV_HANDLE, &ext_adv_params), ble_sem);
-    FUNC_SEND_WAIT_SEM(esp_ble_gap_ext_adv_set_rand_addr(EXT_ADV_HANDLE, rand_addr_broadcast), ble_sem);
-
-    // Configure connectable set (simple flags + name data)
-    FUNC_SEND_WAIT_SEM(esp_ble_gap_ext_adv_set_params(CONN_ADV_HANDLE, &conn_adv_params), ble_sem);
-    FUNC_SEND_WAIT_SEM(esp_ble_gap_ext_adv_set_rand_addr(CONN_ADV_HANDLE, rand_addr_conn), ble_sem);
-    uint8_t conn_adv_data[31];
-    uint8_t p = 0;
-    conn_adv_data[p++] = 0x02; // length
-    conn_adv_data[p++] = ESP_BLE_AD_TYPE_FLAG;
-    conn_adv_data[p++] = 0x06; // general discoverable, BR/EDR not supported
-    const char *cn = "LwM2M-Conn";
-    uint8_t cn_len = strlen(cn);
-    conn_adv_data[p++] = cn_len + 1;
-    conn_adv_data[p++] = ESP_BLE_AD_TYPE_NAME_CMPL;
-    memcpy(&conn_adv_data[p], cn, cn_len);
-    p += cn_len;
-    FUNC_SEND_WAIT_SEM(esp_ble_gap_config_ext_adv_data_raw(CONN_ADV_HANDLE, p, conn_adv_data), ble_sem);
+    FUNC_SEND_WAIT_SEM(esp_ble_gap_ext_adv_set_rand_addr(EXT_ADV_HANDLE, rand_addr_single), ble_sem);
+    // Initial advertising data (Flags + Name); manufacturer data will be injected by broadcast updates when used
+    uint8_t init_adv_data[31];
+    uint8_t q = 0;
+    init_adv_data[q++] = 0x02; // len
+    init_adv_data[q++] = ESP_BLE_AD_TYPE_FLAG;
+    init_adv_data[q++] = 0x06;
+    const char *dev_name = "LwM2M";
+    uint8_t dn_len = strlen(dev_name);
+    init_adv_data[q++] = dn_len + 1;
+    init_adv_data[q++] = ESP_BLE_AD_TYPE_NAME_CMPL;
+    memcpy(&init_adv_data[q], dev_name, dn_len);
+    q += dn_len;
+    FUNC_SEND_WAIT_SEM(esp_ble_gap_config_ext_adv_data_raw(EXT_ADV_HANDLE, q, init_adv_data), ble_sem);
     
     ble_initialized = true;
     ESP_LOGI(TAG, "Bluedroid BLE initialized successfully");
-    // Start connectable advertising immediately (broadcast set started when first broadcast occurs)
-    start_connectable_advertising();
+    // Start unified advertising immediately
+    start_extended_advertising();
     return ESP_OK;
 }
 
