@@ -1,0 +1,3 @@
+[submodule "components/lwm2m-protobuf"]
+	path = components/lwm2m-protobuf
+	url = https://github.com/edgez-ai/lwm2m-protobuf.git
