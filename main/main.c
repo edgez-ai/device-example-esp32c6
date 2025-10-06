@@ -15,8 +15,48 @@
 #include "esp_system.h"
 #include "esp_log.h"
 #include "factory_partition.h"
+#include "mbedtls/base64.h"
+#include "lwm2m.pb.h"
+#include "lwm2m_helpers.h"
 
 static const char *TAG = "main";
+
+static void print_hex_bytes(const char* label, const uint8_t* data, size_t len) {
+    if (len == 0) {
+        ESP_LOGI(TAG, "%s: (empty)", label);
+        return;
+    }
+    
+    char hex_str[len * 2 + 1];
+    for (size_t i = 0; i < len; i++) {
+        sprintf(&hex_str[i * 2], "%02x", data[i]);
+    }
+    hex_str[len * 2] = '\0';
+    ESP_LOGI(TAG, "%s: %s", label, hex_str);
+}
+
+static void print_factory_partition(const lwm2m_FactoryPartition* partition) {
+    ESP_LOGI(TAG, "=== Factory Partition Data ===");
+    ESP_LOGI(TAG, "Model: %ld", (long)partition->model);
+    ESP_LOGI(TAG, "Vendor: %ld", (long)partition->vendor);
+    ESP_LOGI(TAG, "Serial: %ld", (long)partition->serial);
+    
+    print_hex_bytes("Public Key", partition->public_key.bytes, partition->public_key.size);
+    print_hex_bytes("Private Key", partition->private_key.bytes, partition->private_key.size);
+    
+    if (partition->bootstrap_server.size > 0) {
+        // Try to print as string (null-terminate safely)
+        char server_str[partition->bootstrap_server.size + 1];
+        memcpy(server_str, partition->bootstrap_server.bytes, partition->bootstrap_server.size);
+        server_str[partition->bootstrap_server.size] = '\0';
+        ESP_LOGI(TAG, "Bootstrap Server: %s", server_str);
+    } else {
+        ESP_LOGI(TAG, "Bootstrap Server: (empty)");
+    }
+    
+    print_hex_bytes("Signature", partition->signature, 64);
+    ESP_LOGI(TAG, "=============================");
+}
 
 void app_main(void)
 {
@@ -27,20 +67,54 @@ void app_main(void)
     if (err == ESP_OK) {
         ESP_LOGI(TAG, "Factory partition initialized successfully");
         
-        // Read factory data (assuming it's text data)
-        char factory_data[1024] = {0};  // 1KB buffer
-        err = factory_partition_read(0, factory_data, sizeof(factory_data) - 1);
+        // Read factory data (base64 encoded)
+        char factory_data_b64[1024] = {0};  // 1KB buffer for base64 data
+        err = factory_partition_read(0, factory_data_b64, sizeof(factory_data_b64) - 1);
         
         if (err == ESP_OK) {
-            // Ensure null termination
-            factory_data[sizeof(factory_data) - 1] = '\0';
+            // Ensure null termination for base64 string
+            factory_data_b64[sizeof(factory_data_b64) - 1] = '\0';
             
-            // Print the factory data
-            ESP_LOGI(TAG, "Factory data read successfully:");
-            ESP_LOGI(TAG, "Factory data content: %s", factory_data);
+            // Find the actual length of base64 string (stop at first null or newline)
+            size_t b64_len = 0;
+            for (size_t i = 0; i < sizeof(factory_data_b64) - 1; i++) {
+                if (factory_data_b64[i] == '\0' || factory_data_b64[i] == '\n' || factory_data_b64[i] == '\r') {
+                    break;
+                }
+                b64_len++;
+            }
             
-            // Print as hex dump for binary data
-            ESP_LOG_BUFFER_HEX(TAG, factory_data, 64);  // Print first 64 bytes as hex
+            if (b64_len > 0) {
+                ESP_LOGI(TAG, "Factory data read successfully (base64 length: %zu)", b64_len);
+                ESP_LOGI(TAG, "Base64 data: %.100s%s", factory_data_b64, b64_len > 100 ? "..." : "");
+                
+                // Decode base64
+                uint8_t decoded_data[512];  // Buffer for decoded binary data
+                size_t decoded_len = 0;
+                
+                int ret = mbedtls_base64_decode(decoded_data, sizeof(decoded_data), &decoded_len, 
+                                               (const unsigned char*)factory_data_b64, b64_len);
+                
+                if (ret == 0) {
+                    ESP_LOGI(TAG, "Base64 decoded successfully (binary length: %zu)", decoded_len);
+                    ESP_LOG_BUFFER_HEX(TAG, decoded_data, decoded_len < 64 ? decoded_len : 64);
+                    
+                    // Parse protobuf
+                    lwm2m_FactoryPartition factory_partition = lwm2m_FactoryPartition_init_zero;
+                    int parse_result = lwm2m_read_factory_partition(decoded_data, decoded_len, &factory_partition);
+                    
+                    if (parse_result == 0) {
+                        ESP_LOGI(TAG, "Factory partition protobuf parsed successfully");
+                        print_factory_partition(&factory_partition);
+                    } else {
+                        ESP_LOGE(TAG, "Failed to parse factory partition protobuf (error: %d)", parse_result);
+                    }
+                } else {
+                    ESP_LOGE(TAG, "Failed to decode base64 data (mbedtls error: %d)", ret);
+                }
+            } else {
+                ESP_LOGW(TAG, "Factory data appears to be empty");
+            }
         } else {
             ESP_LOGE(TAG, "Failed to read factory data: %s", esp_err_to_name(err));
         }
