@@ -6,6 +6,8 @@
 #include "esp_random.h"
 #include "esp_bt.h"
 #include "esp_gap_ble_api.h"
+#include "esp_gatts_api.h"
+#include "esp_gatt_common_api.h"
 #include "esp_bt_main.h"
 #include "esp_bt_defs.h"
 #include "freertos/semphr.h"
@@ -16,11 +18,13 @@
 
 static const char *TAG = "ble_lwm2m";
 
-#define EXT_ADV_HANDLE      0
-#define NUM_EXT_ADV         1
+// Advertising handles
+#define EXT_ADV_HANDLE          0   // Non-connectable periodic/broadcast set
+#define CONN_ADV_HANDLE         1   // Connectable advertising for GATT characteristic
+#define NUM_EXT_ADV             2
 
 // Separate variable for handle so we can take its address when stopping
-static uint8_t ext_adv_handle = EXT_ADV_HANDLE;
+static uint8_t ext_adv_handle = EXT_ADV_HANDLE; // kept for stop API (broadcast set only)
 
 // Static variables for BLE state
 static lwm2m_FactoryPartition g_factory_partition = {0};
@@ -51,8 +55,67 @@ static esp_ble_gap_ext_adv_params_t ext_adv_params = {
     .tx_power = EXT_ADV_TX_PWR_NO_PREFERENCE,
 };
 
-static esp_ble_gap_ext_adv_t ext_adv[1] = {
-    [0] = {EXT_ADV_HANDLE, 0, 0},
+// Connectable (legacy) advertising params for GATT service access
+static esp_ble_gap_ext_adv_params_t conn_adv_params = {
+    // Extended connectable advertising (NOT scannable; connectable+scannable would force legacy PDUs per spec)
+    .type = ESP_BLE_GAP_SET_EXT_ADV_PROP_CONNECTABLE,
+    .interval_min = 0x40,
+    .interval_max = 0x40,
+    .channel_map = ADV_CHNL_ALL,
+    .filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY,
+    .primary_phy = ESP_BLE_GAP_PHY_1M,
+    .max_skip = 0,
+    .secondary_phy = ESP_BLE_GAP_PHY_1M,
+    .sid = 1,
+    .scan_req_notif = false,
+    .own_addr_type = BLE_ADDR_TYPE_RANDOM,
+    .tx_power = EXT_ADV_TX_PWR_NO_PREFERENCE,
+};
+
+static esp_ble_gap_ext_adv_t ext_adv[NUM_EXT_ADV] = {
+    [0] = {EXT_ADV_HANDLE, 0, 0},      // broadcast set
+    [1] = {CONN_ADV_HANDLE, 0, 0},     // connectable set
+};
+
+/* ---------------- GATT Service / Characteristic (Read/Write) ---------------- */
+#define GATTS_APP_ID                0x55
+static const uint16_t GATTS_SERVICE_UUID = 0xA0F0;   // Example service UUID
+static const uint16_t GATTS_CHAR_RW_UUID = 0xA0F1;   // Example characteristic UUID
+static const uint16_t primary_service_uuid = ESP_GATT_UUID_PRI_SERVICE;
+static const uint16_t character_declaration_uuid = ESP_GATT_UUID_CHAR_DECLARE;
+
+static uint8_t char_prop_rw = ESP_GATT_CHAR_PROP_BIT_READ | ESP_GATT_CHAR_PROP_BIT_WRITE;
+static uint8_t rw_char_value[32] = "LwM2M Hello"; // initial value
+static uint16_t rw_char_value_len = 11;
+
+enum {
+    IDX_SVC,
+    IDX_CHAR_RW_DECL,
+    IDX_CHAR_RW_VAL,
+    GATT_IDX_NB,
+};
+
+static uint16_t gatt_handle_table[GATT_IDX_NB];
+
+static const esp_gatts_attr_db_t gatt_db[GATT_IDX_NB] = {
+    // Primary Service
+    [IDX_SVC] = {
+        {ESP_GATT_AUTO_RSP},
+        {ESP_UUID_LEN_16, (uint8_t *)&primary_service_uuid, ESP_GATT_PERM_READ,
+         sizeof(uint16_t), sizeof(GATTS_SERVICE_UUID), (uint8_t *)&GATTS_SERVICE_UUID}
+    },
+    // Characteristic Declaration
+    [IDX_CHAR_RW_DECL] = {
+        {ESP_GATT_AUTO_RSP},
+        {ESP_UUID_LEN_16, (uint8_t *)&character_declaration_uuid, ESP_GATT_PERM_READ,
+         sizeof(uint8_t), sizeof(uint8_t), &char_prop_rw}
+    },
+    // Characteristic Value
+    [IDX_CHAR_RW_VAL] = {
+        {ESP_GATT_RSP_BY_APP},
+        {ESP_UUID_LEN_16, (uint8_t *)&GATTS_CHAR_RW_UUID, ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE,
+            sizeof(rw_char_value), 11, rw_char_value}
+    },
 };
 
 #define FUNC_SEND_WAIT_SEM(func, sem) do {\
@@ -91,6 +154,61 @@ static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param
     }
 }
 
+static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t *param) {
+    switch (event) {
+    case ESP_GATTS_REG_EVT: {
+        ESP_LOGI(TAG, "GATT app registered, status %d, app_id %d", param->reg.status, param->reg.app_id);
+        esp_err_t ret = esp_ble_gatts_create_attr_tab(gatt_db, gatts_if, GATT_IDX_NB, 0);
+        if (ret) {
+            ESP_LOGE(TAG, "Create attr table failed: %s", esp_err_to_name(ret));
+        }
+        break; }
+    case ESP_GATTS_CREAT_ATTR_TAB_EVT: {
+        if (param->add_attr_tab.status == ESP_GATT_OK && param->add_attr_tab.num_handle == GATT_IDX_NB) {
+            memcpy(gatt_handle_table, param->add_attr_tab.handles, sizeof(gatt_handle_table));
+            esp_ble_gatts_start_service(gatt_handle_table[IDX_SVC]);
+            ESP_LOGI(TAG, "GATT service started (handle %d)", gatt_handle_table[IDX_SVC]);
+        } else {
+            ESP_LOGE(TAG, "Attr table create failed, status 0x%x (num %d)", param->add_attr_tab.status, param->add_attr_tab.num_handle);
+        }
+        break; }
+    case ESP_GATTS_READ_EVT: {
+        esp_gatt_rsp_t rsp = {0};
+        rsp.attr_value.handle = param->read.handle;
+        if (param->read.handle == gatt_handle_table[IDX_CHAR_RW_VAL]) {
+            rsp.attr_value.len = rw_char_value_len;
+            memcpy(rsp.attr_value.value, rw_char_value, rw_char_value_len);
+        }
+        esp_ble_gatts_send_response(gatts_if, param->read.conn_id, param->read.trans_id, ESP_GATT_OK, &rsp);
+        ESP_LOGI(TAG, "Read request on handle %d", param->read.handle);
+        break; }
+    case ESP_GATTS_WRITE_EVT: {
+        if (param->write.handle == gatt_handle_table[IDX_CHAR_RW_VAL]) {
+            size_t wlen = param->write.len > sizeof(rw_char_value) ? sizeof(rw_char_value) : param->write.len;
+            memcpy(rw_char_value, param->write.value, wlen);
+            rw_char_value_len = wlen;
+            ESP_LOGI(TAG, "Characteristic written (%d bytes)", (int)wlen);
+        }
+        if (param->write.need_rsp) {
+            esp_gatt_rsp_t rsp = {0};
+            rsp.attr_value.handle = param->write.handle;
+            rsp.attr_value.len = 0;
+            esp_ble_gatts_send_response(gatts_if, param->write.conn_id, param->write.trans_id, ESP_GATT_OK, &rsp);
+        }
+        break; }
+    case ESP_GATTS_CONNECT_EVT:
+        ESP_LOGI(TAG, "Client connected (conn_id=%d)", param->connect.conn_id);
+        break;
+    case ESP_GATTS_DISCONNECT_EVT:
+        ESP_LOGI(TAG, "Client disconnected (reason=0x%x)", param->disconnect.reason);
+        // Ensure connectable advertising keeps running for new connections
+        esp_ble_gap_ext_adv_start(1, &ext_adv[1]);
+        break;
+    default:
+        break;
+    }
+}
+
 static esp_err_t start_extended_advertising(void) {
     esp_err_t ret = esp_ble_gap_ext_adv_start(1, ext_adv);
     if (ret != ESP_OK) {
@@ -111,6 +229,20 @@ static esp_err_t stop_extended_advertising(void) {
     }
     
     // Wait for advertising stop complete
+    xSemaphoreTake(ble_sem, portMAX_DELAY);
+    return ESP_OK;
+}
+
+// Start the connectable advertising set (GATT access). This runs continuously and is not
+// stopped during periodic broadcast data updates.
+static esp_err_t start_connectable_advertising(void) {
+    // Start only the connectable adv set
+    esp_err_t ret = esp_ble_gap_ext_adv_start(1, &ext_adv[1]);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start connectable advertising: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    // Wait for start complete (reuse semaphore)
     xSemaphoreTake(ble_sem, portMAX_DELAY);
     return ESP_OK;
 }
@@ -209,6 +341,20 @@ esp_err_t ble_lwm2m_init(void) {
         ESP_LOGE(TAG, "Gap register callback failed: %s", esp_err_to_name(ret));
         return ret;
     }
+    // Register GATT server callback & app
+    ret = esp_ble_gatts_register_callback(gatts_event_handler);
+    if (ret) {
+        ESP_LOGE(TAG, "GATTS register callback failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    ret = esp_ble_gatts_app_register(GATTS_APP_ID);
+    if (ret) {
+        ESP_LOGE(TAG, "GATTS app register failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    // Optional device name for connectable adv
+    esp_ble_gap_set_device_name("LwM2M-Device");
     
     // Create semaphore for synchronization
     ble_sem = xSemaphoreCreateBinary();
@@ -217,17 +363,37 @@ esp_err_t ble_lwm2m_init(void) {
         return ESP_ERR_NO_MEM;
     }
     
-    // Create random address
-    esp_bd_addr_t rand_addr;
-    esp_ble_gap_addr_create_static(rand_addr);
-    ESP_LOG_BUFFER_HEX(TAG, rand_addr, ESP_BD_ADDR_LEN);
+    // Create random addresses for both advertising sets
+    esp_bd_addr_t rand_addr_broadcast;
+    esp_ble_gap_addr_create_static(rand_addr_broadcast);
+    ESP_LOG_BUFFER_HEX(TAG, rand_addr_broadcast, ESP_BD_ADDR_LEN);
+    esp_bd_addr_t rand_addr_conn;
+    esp_ble_gap_addr_create_static(rand_addr_conn);
     
-    // Set extended advertising parameters
+    // Configure broadcast (non-connectable) set
     FUNC_SEND_WAIT_SEM(esp_ble_gap_ext_adv_set_params(EXT_ADV_HANDLE, &ext_adv_params), ble_sem);
-    FUNC_SEND_WAIT_SEM(esp_ble_gap_ext_adv_set_rand_addr(EXT_ADV_HANDLE, rand_addr), ble_sem);
+    FUNC_SEND_WAIT_SEM(esp_ble_gap_ext_adv_set_rand_addr(EXT_ADV_HANDLE, rand_addr_broadcast), ble_sem);
+
+    // Configure connectable set (simple flags + name data)
+    FUNC_SEND_WAIT_SEM(esp_ble_gap_ext_adv_set_params(CONN_ADV_HANDLE, &conn_adv_params), ble_sem);
+    FUNC_SEND_WAIT_SEM(esp_ble_gap_ext_adv_set_rand_addr(CONN_ADV_HANDLE, rand_addr_conn), ble_sem);
+    uint8_t conn_adv_data[31];
+    uint8_t p = 0;
+    conn_adv_data[p++] = 0x02; // length
+    conn_adv_data[p++] = ESP_BLE_AD_TYPE_FLAG;
+    conn_adv_data[p++] = 0x06; // general discoverable, BR/EDR not supported
+    const char *cn = "LwM2M-Conn";
+    uint8_t cn_len = strlen(cn);
+    conn_adv_data[p++] = cn_len + 1;
+    conn_adv_data[p++] = ESP_BLE_AD_TYPE_NAME_CMPL;
+    memcpy(&conn_adv_data[p], cn, cn_len);
+    p += cn_len;
+    FUNC_SEND_WAIT_SEM(esp_ble_gap_config_ext_adv_data_raw(CONN_ADV_HANDLE, p, conn_adv_data), ble_sem);
     
     ble_initialized = true;
     ESP_LOGI(TAG, "Bluedroid BLE initialized successfully");
+    // Start connectable advertising immediately (broadcast set started when first broadcast occurs)
+    start_connectable_advertising();
     return ESP_OK;
 }
 
