@@ -43,6 +43,49 @@ For more information on structure and contents of ESP-IDF projects, please refer
     * Hardware connection is not correct: run `idf.py -p PORT monitor`, and reboot your board to see if there are any output logs.
     * The baud rate for downloading is too high: lower your baud rate in the `menuconfig` menu, and try again.
 
+## Flashing Factory Data
+
+This project uses a custom partition table with a dedicated factory data partition. To flash factory data to the device:
+
+### Flash Factory Data Binary
+
+```bash
+# Flash factory.bin to the factory_data partition
+idf.py partition-table-flash
+idf.py write_flash 0x713000 factory.bin
+```
+
+Or use the partition name directly:
+
+```bash
+# Flash using partition name (recommended)
+esptool.py --chip esp32c6 --port /dev/tty.usbmodem1401 --baud 460800 write_flash 0x713000 factory.bin
+```
+
+### Generate Factory Data
+
+If you need to create a factory.bin file, you can use the factory partition encoding script:
+
+```bash
+# Example: Generate factory data with device information
+python3 components/lwm2m-protobuf/factory_partition_encode.py \
+    --model 1 --vendor 100 --serial 12345678 \
+    --public-key hex:001122... \
+    --bootstrap-server "https://bootstrap.example.com" \
+    > factory.bin
+```
+
+### Verify Factory Data
+
+After flashing, you can read back the factory data to verify:
+
+```bash
+# Read factory data partition
+esptool.py --chip esp32c6 --port /dev/ttyUSB0 read_flash 0x713000 0x1000 factory_readback.bin
+```
+
+**Note**: The factory data partition is located at offset `0x713000` with a size of `0x1000` (4KB) as defined in the custom partition table.
+
 ## Technical support and feedback
 
 Please use the following feedback channels:

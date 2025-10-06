@@ -6,16 +6,47 @@
 
 #include <stdio.h>
 #include <inttypes.h>
+#include <string.h>
 #include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_chip_info.h"
 #include "esp_flash.h"
 #include "esp_system.h"
+#include "esp_log.h"
+#include "factory_partition.h"
+
+static const char *TAG = "main";
 
 void app_main(void)
 {
     printf("Hello world!\n");
+
+    /* Initialize and read factory partition */
+    esp_err_t err = factory_partition_init();
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "Factory partition initialized successfully");
+        
+        // Read factory data (assuming it's text data)
+        char factory_data[1024] = {0};  // 1KB buffer
+        err = factory_partition_read(0, factory_data, sizeof(factory_data) - 1);
+        
+        if (err == ESP_OK) {
+            // Ensure null termination
+            factory_data[sizeof(factory_data) - 1] = '\0';
+            
+            // Print the factory data
+            ESP_LOGI(TAG, "Factory data read successfully:");
+            ESP_LOGI(TAG, "Factory data content: %s", factory_data);
+            
+            // Print as hex dump for binary data
+            ESP_LOG_BUFFER_HEX(TAG, factory_data, 64);  // Print first 64 bytes as hex
+        } else {
+            ESP_LOGE(TAG, "Failed to read factory data: %s", esp_err_to_name(err));
+        }
+    } else {
+        ESP_LOGE(TAG, "Failed to initialize factory partition: %s", esp_err_to_name(err));
+    }
 
     /* Print chip information */
     esp_chip_info_t chip_info;
