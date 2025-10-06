@@ -15,6 +15,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/timers.h"
+#include "nvs.h"
+#include "nvs_flash.h"
 
 static const char *TAG = "ble_lwm2m";
 
@@ -29,6 +31,8 @@ static uint8_t ext_adv_handle = EXT_ADV_HANDLE; // for stop API
 static lwm2m_FactoryPartition g_factory_partition = {0};
 static bool g_factory_partition_valid = false;
 static bool g_aes_key_exists = false;
+static uint8_t g_aes_key[32];
+static size_t g_aes_key_len = 0; // 16 / 24 / 32
 static TimerHandle_t broadcast_timer = NULL;
 static bool ble_initialized = false;
 static TaskHandle_t broadcast_task_handle = NULL;
@@ -37,6 +41,8 @@ static SemaphoreHandle_t ble_sem = NULL;
 
 // Forward declaration for internal helper used by broadcast task
 static bool ble_lwm2m_check_aes_key(uint32_t *boot_count_out);
+static esp_err_t ble_lwm2m_store_aes_key(const uint8_t *key, size_t len);
+static esp_err_t ble_lwm2m_load_aes_key(void);
 
 // Extended advertising parameters for periodic broadcasting
 static esp_ble_gap_ext_adv_params_t ext_adv_params = {
@@ -171,6 +177,17 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
             memcpy(rw_char_value, param->write.value, wlen);
             rw_char_value_len = wlen;
             ESP_LOGI(TAG, "Characteristic written (%d bytes)", (int)wlen);
+
+            // Treat write as provisioning an AES key if length matches 16/24/32 bytes
+            if (wlen == 16 || wlen == 24 || wlen == 32) {
+                if (ble_lwm2m_store_aes_key(param->write.value, wlen) == ESP_OK) {
+                    ESP_LOGI(TAG, "AES key stored (len=%d)", (int)wlen);
+                } else {
+                    ESP_LOGE(TAG, "Failed to store AES key");
+                }
+            } else {
+                ESP_LOGW(TAG, "Written value length (%d) not a valid AES key size (16/24/32)", (int)wlen);
+            }
         }
         if (param->write.need_rsp) {
             esp_gatt_rsp_t rsp = {0};
@@ -328,6 +345,18 @@ esp_err_t ble_lwm2m_init(void) {
 
     // Optional device name for connectable adv
     esp_ble_gap_set_device_name("LwM2M-Device");
+
+    // Ensure NVS is initialized (if app hasn't already). It's safe to call twice.
+    esp_err_t nvs_ret = nvs_flash_init();
+    if (nvs_ret == ESP_ERR_NVS_NO_FREE_PAGES || nvs_ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        nvs_ret = nvs_flash_init();
+    }
+    if (nvs_ret != ESP_OK) {
+        ESP_LOGE(TAG, "NVS init failed: %s", esp_err_to_name(nvs_ret));
+    } else {
+        ble_lwm2m_load_aes_key();
+    }
     
     // Create semaphore for synchronization
     ble_sem = xSemaphoreCreateBinary();
@@ -615,4 +644,53 @@ void ble_lwm2m_deinit(void) {
     
     ble_initialized = false;
     ESP_LOGI(TAG, "BLE deinitialized");
+}
+
+// ---------------- AES Key Persistence Helpers ----------------
+static esp_err_t ble_lwm2m_store_aes_key(const uint8_t *key, size_t len) {
+    if (!(len == 16 || len == 24 || len == 32)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    memcpy(g_aes_key, key, len);
+    g_aes_key_len = len;
+    g_aes_key_exists = true;
+
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open("ble_lwm2m", NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        return err; // Keep in-RAM copy even if persistence fails
+    }
+    err = nvs_set_blob(handle, "aes_key", key, len);
+    if (err == ESP_OK) {
+        err = nvs_set_u8(handle, "aes_len", (uint8_t)len);
+    }
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    return err;
+}
+
+static esp_err_t ble_lwm2m_load_aes_key(void) {
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open("ble_lwm2m", NVS_READONLY, &handle);
+    if (err != ESP_OK) {
+        return err;
+    }
+    size_t len = sizeof(g_aes_key);
+    uint8_t stored_len = 0;
+    err = nvs_get_u8(handle, "aes_len", &stored_len);
+    if (err != ESP_OK || !(stored_len == 16 || stored_len == 24 || stored_len == 32)) {
+        nvs_close(handle);
+        return ESP_ERR_NOT_FOUND;
+    }
+    len = stored_len; // Only read exact stored length
+    err = nvs_get_blob(handle, "aes_key", g_aes_key, &len);
+    nvs_close(handle);
+    if (err == ESP_OK && (len == 16 || len == 24 || len == 32)) {
+        g_aes_key_len = len;
+        g_aes_key_exists = true;
+        ESP_LOGI(TAG, "Loaded AES key from NVS (len=%u)", (unsigned)len);
+    }
+    return err;
 }

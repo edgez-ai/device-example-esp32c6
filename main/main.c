@@ -27,6 +27,7 @@ static const char *TAG = "main";
 #define NVS_NAMESPACE "test_storage"
 #define NVS_TEST_KEY "boot_count"
 #define NVS_AES_KEY "aes_key"
+#define NVS_AES_NAMESPACE "ble_lwm2m"  // Must match namespace used in ble_lwm2m.c for AES key persistence
 #define BROADCAST_INTERVAL_MS 10000  // 10 seconds
 
 // Global variables for device info
@@ -72,28 +73,47 @@ static void print_factory_partition(const lwm2m_FactoryPartition* partition) {
 }
 
 static bool check_aes_key_exists(void) {
-    nvs_handle_t nvs_handle;
-    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs_handle);
+    // Mirror logic in ble_lwm2m_load_aes_key(): AES key is stored in namespace "ble_lwm2m"
+    // with blob key "aes_key" and a length byte "aes_len" that must be 16/24/32.
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(NVS_AES_NAMESPACE, NVS_READONLY, &handle);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to open NVS handle for AES key check: %s", esp_err_to_name(err));
+        if (err != ESP_ERR_NVS_NOT_FOUND) {
+            ESP_LOGW(TAG, "AES key namespace open failed: %s", esp_err_to_name(err));
+        } else {
+            ESP_LOGI(TAG, "AES key namespace not found yet");
+        }
         return false;
     }
-    
-    size_t required_size = 32;  // AES-256 key size
-    uint8_t aes_key[32];
-    err = nvs_get_blob(nvs_handle, NVS_AES_KEY, aes_key, &required_size);
-    nvs_close(nvs_handle);
-    
-    if (err == ESP_OK && required_size == 32) {
-        ESP_LOGI(TAG, "AES key found in NVS");
+
+    uint8_t stored_len = 0;
+    err = nvs_get_u8(handle, "aes_len", &stored_len);
+    if (err != ESP_OK || !(stored_len == 16 || stored_len == 24 || stored_len == 32)) {
+        if (err == ESP_ERR_NVS_NOT_FOUND) {
+            ESP_LOGI(TAG, "AES key length marker not present");
+        } else {
+            ESP_LOGW(TAG, "Failed to read AES key length: %s", esp_err_to_name(err));
+        }
+        nvs_close(handle);
+        return false;
+    }
+
+    size_t len = stored_len; // only attempt to read expected bytes
+    uint8_t tmp_key[32];
+    err = nvs_get_blob(handle, NVS_AES_KEY, tmp_key, &len);
+    nvs_close(handle);
+
+    if (err == ESP_OK && len == stored_len) {
+        ESP_LOGI(TAG, "AES key found in NVS (len=%u)", (unsigned)len);
         return true;
-    } else if (err == ESP_ERR_NVS_NOT_FOUND) {
-        ESP_LOGI(TAG, "AES key not found in NVS");
-        return false;
-    } else {
-        ESP_LOGE(TAG, "Error reading AES key from NVS: %s", esp_err_to_name(err));
-        return false;
     }
+
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGI(TAG, "AES key blob not found (len marker existed)");
+    } else {
+        ESP_LOGW(TAG, "Error reading AES key blob: %s", esp_err_to_name(err));
+    }
+    return false;
 }
 
 static void test_nvs_functionality(void)
