@@ -1,8 +1,5 @@
 /*
- * SPDX-FileCopyrightTex#define BOOT_BUTTON_GPIO    9  // Use GPIO 9 instead of 0 to avoid bootloader conflict
-#define BUTTON_PRESS_TIME_MS 3000  // 3 seconds
-#define NVS_NAMESPACE "test_storage"
-#define NVS_BUTTON_KEY "button_pressed"010-2022 Espressif Systems (Shanghai) CO LTD
+ * SPDX-FileCopyrightText: 2010-2022 Espressif Systems (Shanghai) CO LTD
  *
  * SPDX-License-Identifier: CC0-1.0
  */
@@ -23,11 +20,19 @@
 #include "lwm2m_helpers.h"
 #include "nvs_flash.h"
 #include "nvs.h"
+#include "ble_lwm2m.h"
 
 static const char *TAG = "main";
 
 #define NVS_NAMESPACE "test_storage"
 #define NVS_TEST_KEY "boot_count"
+#define NVS_AES_KEY "aes_key"
+#define BROADCAST_INTERVAL_MS 10000  // 10 seconds
+
+// Global variables for device info
+static lwm2m_FactoryPartition g_factory_partition = {0};
+static bool g_factory_partition_valid = false;
+static bool g_aes_key_exists = false;
 
 static void print_hex_bytes(const char* label, const uint8_t* data, size_t len) {
     if (len == 0) {
@@ -64,6 +69,31 @@ static void print_factory_partition(const lwm2m_FactoryPartition* partition) {
     
     print_hex_bytes("Signature", partition->signature, 64);
     ESP_LOGI(TAG, "=============================");
+}
+
+static bool check_aes_key_exists(void) {
+    nvs_handle_t nvs_handle;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to open NVS handle for AES key check: %s", esp_err_to_name(err));
+        return false;
+    }
+    
+    size_t required_size = 32;  // AES-256 key size
+    uint8_t aes_key[32];
+    err = nvs_get_blob(nvs_handle, NVS_AES_KEY, aes_key, &required_size);
+    nvs_close(nvs_handle);
+    
+    if (err == ESP_OK && required_size == 32) {
+        ESP_LOGI(TAG, "AES key found in NVS");
+        return true;
+    } else if (err == ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGI(TAG, "AES key not found in NVS");
+        return false;
+    } else {
+        ESP_LOGE(TAG, "Error reading AES key from NVS: %s", esp_err_to_name(err));
+        return false;
+    }
 }
 
 static void test_nvs_functionality(void)
@@ -123,13 +153,25 @@ static void test_nvs_functionality(void)
 
 void app_main(void)
 {
-    printf("Hello world!\n");
+    printf("LwM2M BLE Device Starting...\n");
+    
+    // Initialize NVS
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_LOGW(TAG, "NVS partition was truncated and will be erased");
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        err = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(err);
     
     // Test NVS functionality to verify factory reset works
     test_nvs_functionality();
+    
+    // Check if AES key exists in NVS
+    g_aes_key_exists = check_aes_key_exists();
 
     /* Initialize and read factory partition */
-    esp_err_t err = factory_partition_init();
+    err = factory_partition_init();
     if (err == ESP_OK) {
         ESP_LOGI(TAG, "Factory partition initialized successfully");
         
@@ -166,12 +208,13 @@ void app_main(void)
                     ESP_LOG_BUFFER_HEX(TAG, decoded_data, decoded_len < 64 ? decoded_len : 64);
                     
                     // Parse protobuf
-                    lwm2m_FactoryPartition factory_partition = lwm2m_FactoryPartition_init_zero;
-                    int parse_result = lwm2m_read_factory_partition(decoded_data, decoded_len, &factory_partition);
+                    g_factory_partition = (lwm2m_FactoryPartition)lwm2m_FactoryPartition_init_zero;
+                    int parse_result = lwm2m_read_factory_partition(decoded_data, decoded_len, &g_factory_partition);
                     
                     if (parse_result == 0) {
                         ESP_LOGI(TAG, "Factory partition protobuf parsed successfully");
-                        print_factory_partition(&factory_partition);
+                        print_factory_partition(&g_factory_partition);
+                        g_factory_partition_valid = true;
                     } else {
                         ESP_LOGE(TAG, "Failed to parse factory partition protobuf (error: %d)", parse_result);
                     }
@@ -213,11 +256,43 @@ void app_main(void)
 
     printf("Minimum free heap size: %" PRIu32 " bytes\n", esp_get_minimum_free_heap_size());
 
-    for (int i = 10; i >= 0; i--) {
-        printf("Restarting in %d seconds...\n", i);
-        vTaskDelay(1000 / portTICK_PERIOD_MS);
+    // Check if we have BLE capability
+    if (!(chip_info.features & CHIP_FEATURE_BLE)) {
+        ESP_LOGE(TAG, "This chip does not support BLE");
+        return;
     }
-    printf("Restarting now.\n");
-    fflush(stdout);
-    esp_restart();
+
+    // Initialize BLE
+    err = ble_lwm2m_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "BLE LwM2M initialization failed");
+        return;
+    }
+
+    // Configure BLE with factory partition and AES key status
+    ble_lwm2m_set_factory_partition(&g_factory_partition, g_factory_partition_valid);
+    ble_lwm2m_set_aes_key_status(g_aes_key_exists);
+
+    // Log the operational mode
+    if (g_aes_key_exists) {
+        ESP_LOGI(TAG, "AES key found - will broadcast temperature data every %d seconds", BROADCAST_INTERVAL_MS / 1000);
+    } else {
+        ESP_LOGI(TAG, "No AES key found - will broadcast LwM2M appearance every %d seconds", BROADCAST_INTERVAL_MS / 1000);
+    }
+
+    // Start periodic broadcasting
+    err = ble_lwm2m_start_periodic_broadcast(BROADCAST_INTERVAL_MS);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start periodic broadcasting");
+        return;
+    }
+
+    ESP_LOGI(TAG, "LwM2M BLE Device initialized successfully");
+    ESP_LOGI(TAG, "Broadcasting will begin in %d seconds...", BROADCAST_INTERVAL_MS / 1000);
+
+    // Main loop - just keep the system running
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(5000));
+        ESP_LOGI(TAG, "System running... Free heap: %" PRIu32 " bytes", esp_get_free_heap_size());
+    }
 }
