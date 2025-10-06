@@ -1,5 +1,8 @@
 /*
- * SPDX-FileCopyrightText: 2010-2022 Espressif Systems (Shanghai) CO LTD
+ * SPDX-FileCopyrightTex#define BOOT_BUTTON_GPIO    9  // Use GPIO 9 instead of 0 to avoid bootloader conflict
+#define BUTTON_PRESS_TIME_MS 3000  // 3 seconds
+#define NVS_NAMESPACE "test_storage"
+#define NVS_BUTTON_KEY "button_pressed"010-2022 Espressif Systems (Shanghai) CO LTD
  *
  * SPDX-License-Identifier: CC0-1.0
  */
@@ -18,8 +21,13 @@
 #include "mbedtls/base64.h"
 #include "lwm2m.pb.h"
 #include "lwm2m_helpers.h"
+#include "nvs_flash.h"
+#include "nvs.h"
 
 static const char *TAG = "main";
+
+#define NVS_NAMESPACE "test_storage"
+#define NVS_TEST_KEY "boot_count"
 
 static void print_hex_bytes(const char* label, const uint8_t* data, size_t len) {
     if (len == 0) {
@@ -58,9 +66,67 @@ static void print_factory_partition(const lwm2m_FactoryPartition* partition) {
     ESP_LOGI(TAG, "=============================");
 }
 
+static void test_nvs_functionality(void)
+{
+    ESP_LOGI(TAG, "=== Testing NVS Functionality ===");
+    
+    // Initialize NVS
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_LOGW(TAG, "NVS partition was truncated and will be erased");
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        err = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(err);
+    
+    nvs_handle_t nvs_handle;
+    err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to open NVS handle: %s", esp_err_to_name(err));
+        return;
+    }
+    
+    // Try to read existing value
+    uint32_t boot_count = 0;
+    size_t required_size = sizeof(boot_count);
+    err = nvs_get_u32(nvs_handle, NVS_TEST_KEY, &boot_count);
+    
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "Previous boot count found: %lu", (unsigned long)boot_count);
+    } else if (err == ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGI(TAG, "Boot count not found - this appears to be first boot or after factory reset");
+        boot_count = 0;
+    } else {
+        ESP_LOGE(TAG, "Failed to read boot count: %s", esp_err_to_name(err));
+        nvs_close(nvs_handle);
+        return;
+    }
+    
+    // Increment and save boot count
+    boot_count++;
+    err = nvs_set_u32(nvs_handle, NVS_TEST_KEY, boot_count);
+    if (err == ESP_OK) {
+        err = nvs_commit(nvs_handle);
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "✓ Boot count updated to: %lu", (unsigned long)boot_count);
+            ESP_LOGI(TAG, "✓ NVS write/read test PASSED");
+        } else {
+            ESP_LOGE(TAG, "Failed to commit NVS: %s", esp_err_to_name(err));
+        }
+    } else {
+        ESP_LOGE(TAG, "Failed to set NVS value: %s", esp_err_to_name(err));
+    }
+    
+    nvs_close(nvs_handle);
+    ESP_LOGI(TAG, "=============================");
+}
+
 void app_main(void)
 {
     printf("Hello world!\n");
+    
+    // Test NVS functionality to verify factory reset works
+    test_nvs_functionality();
 
     /* Initialize and read factory partition */
     esp_err_t err = factory_partition_init();
