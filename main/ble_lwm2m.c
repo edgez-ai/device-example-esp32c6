@@ -122,12 +122,12 @@ static esp_ble_gap_ext_adv_params_t ext_adv_params_LR = {
 };
 
 static esp_ble_gap_periodic_adv_params_t periodic_adv_params = {
-	/* 5 s periodic adv interval: 5000 ms / 1.25 ms = 4000 (0x0FA0) */
-	/* NOTE: Periodic advertising interval units are 1.25 ms, so 5s = 4000 (0x0FA0).
-	 * We match extended adv update (set to 0x1F40 in 0.625 ms units) roughly.
+	/* 1 s periodic adv interval: 1000 ms / 1.25 ms = 800 (0x320) */
+	/* NOTE: Periodic advertising interval units are 1.25 ms, so 1s = 800 (0x320).
+	 * We match extended adv update (set to 0x640 in 0.625 ms units) roughly.
 	 */
-	.interval_min = 0x0FA0,
-	.interval_max = 0x0FA0,
+	.interval_min = 0x320,
+	.interval_max = 0x320,
 	.properties = 0,
 };
 
