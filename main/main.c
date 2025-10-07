@@ -14,7 +14,7 @@
 #include "esp_flash.h"
 #include "esp_system.h"
 #include "esp_log.h"
-#include "factory_partition.h"
+#include "flash.h"
 #include "mbedtls/base64.h"
 #include "lwm2m.pb.h"
 #include "lwm2m_helpers.h"
@@ -72,49 +72,7 @@ static void print_factory_partition(const lwm2m_FactoryPartition* partition) {
     ESP_LOGI(TAG, "=============================");
 }
 
-static bool check_aes_key_exists(void) {
-    // Mirror logic in ble_lwm2m_load_aes_key(): AES key is stored in namespace "ble_lwm2m"
-    // with blob key "aes_key" and a length byte "aes_len" that must be 16/24/32.
-    nvs_handle_t handle;
-    esp_err_t err = nvs_open(NVS_AES_NAMESPACE, NVS_READONLY, &handle);
-    if (err != ESP_OK) {
-        if (err != ESP_ERR_NVS_NOT_FOUND) {
-            ESP_LOGW(TAG, "AES key namespace open failed: %s", esp_err_to_name(err));
-        } else {
-            ESP_LOGI(TAG, "AES key namespace not found yet");
-        }
-        return false;
-    }
-
-    uint8_t stored_len = 0;
-    err = nvs_get_u8(handle, "aes_len", &stored_len);
-    if (err != ESP_OK || !(stored_len == 16 || stored_len == 24 || stored_len == 32)) {
-        if (err == ESP_ERR_NVS_NOT_FOUND) {
-            ESP_LOGI(TAG, "AES key length marker not present");
-        } else {
-            ESP_LOGW(TAG, "Failed to read AES key length: %s", esp_err_to_name(err));
-        }
-        nvs_close(handle);
-        return false;
-    }
-
-    size_t len = stored_len; // only attempt to read expected bytes
-    uint8_t tmp_key[32];
-    err = nvs_get_blob(handle, NVS_AES_KEY, tmp_key, &len);
-    nvs_close(handle);
-
-    if (err == ESP_OK && len == stored_len) {
-        ESP_LOGI(TAG, "AES key found in NVS (len=%u)", (unsigned)len);
-        return true;
-    }
-
-    if (err == ESP_ERR_NVS_NOT_FOUND) {
-        ESP_LOGI(TAG, "AES key blob not found (len marker existed)");
-    } else {
-        ESP_LOGW(TAG, "Error reading AES key blob: %s", esp_err_to_name(err));
-    }
-    return false;
-}
+// AES key presence now provided by flash_check_aes_key_exists()
 
 static void test_nvs_functionality(void)
 {
@@ -187,68 +145,15 @@ void app_main(void)
     // Test NVS functionality to verify factory reset works
     test_nvs_functionality();
     
-    // Check if AES key exists in NVS
-    g_aes_key_exists = check_aes_key_exists();
+    // Check AES key presence via flash module
+    g_aes_key_exists = flash_check_aes_key_exists();
 
-    /* Initialize and read factory partition */
-    err = factory_partition_init();
+    // Load LwM2M factory partition (decode + parse)
+    err = flash_load_lwm2m_factory_partition(&g_factory_partition, &g_factory_partition_valid);
     if (err == ESP_OK) {
-        ESP_LOGI(TAG, "Factory partition initialized successfully");
-        
-        // Read factory data (base64 encoded)
-        char factory_data_b64[1024] = {0};  // 1KB buffer for base64 data
-        err = factory_partition_read(0, factory_data_b64, sizeof(factory_data_b64) - 1);
-        
-        if (err == ESP_OK) {
-            // Ensure null termination for base64 string
-            factory_data_b64[sizeof(factory_data_b64) - 1] = '\0';
-            
-            // Find the actual length of base64 string (stop at first null or newline)
-            size_t b64_len = 0;
-            for (size_t i = 0; i < sizeof(factory_data_b64) - 1; i++) {
-                if (factory_data_b64[i] == '\0' || factory_data_b64[i] == '\n' || factory_data_b64[i] == '\r') {
-                    break;
-                }
-                b64_len++;
-            }
-            
-            if (b64_len > 0) {
-                ESP_LOGI(TAG, "Factory data read successfully (base64 length: %zu)", b64_len);
-                ESP_LOGI(TAG, "Base64 data: %.100s%s", factory_data_b64, b64_len > 100 ? "..." : "");
-                
-                // Decode base64
-                uint8_t decoded_data[512];  // Buffer for decoded binary data
-                size_t decoded_len = 0;
-                
-                int ret = mbedtls_base64_decode(decoded_data, sizeof(decoded_data), &decoded_len, 
-                                               (const unsigned char*)factory_data_b64, b64_len);
-                
-                if (ret == 0) {
-                    ESP_LOGI(TAG, "Base64 decoded successfully (binary length: %zu)", decoded_len);
-                    ESP_LOG_BUFFER_HEX(TAG, decoded_data, decoded_len < 64 ? decoded_len : 64);
-                    
-                    // Parse protobuf
-                    g_factory_partition = (lwm2m_FactoryPartition)lwm2m_FactoryPartition_init_zero;
-                    int parse_result = lwm2m_read_factory_partition(decoded_data, decoded_len, &g_factory_partition);
-                    
-                    if (parse_result == 0) {
-                        ESP_LOGI(TAG, "Factory partition protobuf parsed successfully");
-                        print_factory_partition(&g_factory_partition);
-                        g_factory_partition_valid = true;
-                    } else {
-                        ESP_LOGE(TAG, "Failed to parse factory partition protobuf (error: %d)", parse_result);
-                    }
-                } else {
-                    ESP_LOGE(TAG, "Failed to decode base64 data (mbedtls error: %d)", ret);
-                }
-            } else {
-                ESP_LOGW(TAG, "Factory data appears to be empty");
-            }
-        } else {
-            ESP_LOGE(TAG, "Failed to read factory data: %s", esp_err_to_name(err));
-        }
+        flash_debug_print_factory_partition(&g_factory_partition, g_factory_partition_valid);
     } else {
-        ESP_LOGE(TAG, "Failed to initialize factory partition: %s", esp_err_to_name(err));
+        ESP_LOGW(TAG, "Factory partition load failed: %s", esp_err_to_name(err));
     }
 
     /* Print chip information */
