@@ -107,8 +107,9 @@ static const esp_gatts_attr_db_t gatt_db[GATT_IDX_NB] = {
 /* Long Range (LE Coded PHY) extended advertising parameters */
 static esp_ble_gap_ext_adv_params_t ext_adv_params_LR = {
 	.type = ESP_BLE_GAP_SET_EXT_ADV_PROP_NONCONN_NONSCANNABLE_UNDIRECTED,
-	.interval_min = 0x60,
-	.interval_max = 0x60,
+	/* 5 s advertising interval: 5000 ms / 0.625 ms = 8000 (0x1F40) */
+	.interval_min = 0x1F40,
+	.interval_max = 0x1F40,
 	.channel_map = ADV_CHNL_ALL,
 	.filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY,
 	.primary_phy = ESP_BLE_GAP_PHY_CODED,
@@ -121,8 +122,12 @@ static esp_ble_gap_ext_adv_params_t ext_adv_params_LR = {
 };
 
 static esp_ble_gap_periodic_adv_params_t periodic_adv_params = {
-	.interval_min = 0x40,
-	.interval_max = 0x40,
+	/* 5 s periodic adv interval: 5000 ms / 1.25 ms = 4000 (0x0FA0) */
+	/* NOTE: Periodic advertising interval units are 1.25 ms, so 5s = 4000 (0x0FA0).
+	 * We match extended adv update (set to 0x1F40 in 0.625 ms units) roughly.
+	 */
+	.interval_min = 0x0FA0,
+	.interval_max = 0x0FA0,
 	.properties = 0,
 };
 
