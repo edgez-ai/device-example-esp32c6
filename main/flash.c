@@ -17,6 +17,12 @@ static const esp_partition_t *s_factory_partition = NULL;
 #define NVS_AES_NAMESPACE "ble_lwm2m"
 #define NVS_AES_KEY       "aes_key"
 
+
+#define NVS_NAMESPACE "test_storage"
+#define NVS_TEST_KEY "boot_count"
+#define NVS_AES_KEY "aes_key"
+#define NVS_AES_NAMESPACE "ble_lwm2m"  // Must match namespace used in ble_lwm2m.c for AES key persistence
+
 esp_err_t flash_factory_partition_init(void)
 {
     if (s_factory_partition) {
@@ -193,4 +199,60 @@ esp_err_t flash_load_lwm2m_factory_partition(lwm2m_FactoryPartition* out_partiti
     }
     if (valid) *valid = true;
     return ESP_OK;
+}
+
+
+void test_nvs_functionality(void)
+{
+    ESP_LOGI(TAG, "=== Testing NVS Functionality ===");
+    
+    // Initialize NVS
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_LOGW(TAG, "NVS partition was truncated and will be erased");
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        err = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(err);
+    
+    nvs_handle_t nvs_handle;
+    err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to open NVS handle: %s", esp_err_to_name(err));
+        return;
+    }
+    
+    // Try to read existing value
+    uint32_t boot_count = 0;
+    size_t required_size = sizeof(boot_count);
+    err = nvs_get_u32(nvs_handle, NVS_TEST_KEY, &boot_count);
+    
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "Previous boot count found: %lu", (unsigned long)boot_count);
+    } else if (err == ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGI(TAG, "Boot count not found - this appears to be first boot or after factory reset");
+        boot_count = 0;
+    } else {
+        ESP_LOGE(TAG, "Failed to read boot count: %s", esp_err_to_name(err));
+        nvs_close(nvs_handle);
+        return;
+    }
+    
+    // Increment and save boot count
+    boot_count++;
+    err = nvs_set_u32(nvs_handle, NVS_TEST_KEY, boot_count);
+    if (err == ESP_OK) {
+        err = nvs_commit(nvs_handle);
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "✓ Boot count updated to: %lu", (unsigned long)boot_count);
+            ESP_LOGI(TAG, "✓ NVS write/read test PASSED");
+        } else {
+            ESP_LOGE(TAG, "Failed to commit NVS: %s", esp_err_to_name(err));
+        }
+    } else {
+        ESP_LOGE(TAG, "Failed to set NVS value: %s", esp_err_to_name(err));
+    }
+    
+    nvs_close(nvs_handle);
+    ESP_LOGI(TAG, "=============================");
 }

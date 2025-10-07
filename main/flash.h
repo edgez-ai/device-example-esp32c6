@@ -34,7 +34,7 @@ esp_err_t flash_load_lwm2m_factory_partition(lwm2m_FactoryPartition* out_partiti
 
 /* Optional debug printer (safe no-op if partition invalid). */
 void flash_debug_print_factory_partition(const lwm2m_FactoryPartition* partition, bool valid);
-
+void test_nvs_functionality(void);
 #ifdef __cplusplus
 }
 #endif

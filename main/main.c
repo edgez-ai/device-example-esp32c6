@@ -24,10 +24,6 @@
 
 static const char *TAG = "main";
 
-#define NVS_NAMESPACE "test_storage"
-#define NVS_TEST_KEY "boot_count"
-#define NVS_AES_KEY "aes_key"
-#define NVS_AES_NAMESPACE "ble_lwm2m"  // Must match namespace used in ble_lwm2m.c for AES key persistence
 #define BROADCAST_INTERVAL_MS 10000  // 10 seconds
 
 // Global variables for device info
@@ -35,99 +31,6 @@ static lwm2m_FactoryPartition g_factory_partition = {0};
 static bool g_factory_partition_valid = false;
 static bool g_aes_key_exists = false;
 
-static void print_hex_bytes(const char* label, const uint8_t* data, size_t len) {
-    if (len == 0) {
-        ESP_LOGI(TAG, "%s: (empty)", label);
-        return;
-    }
-    
-    char hex_str[len * 2 + 1];
-    for (size_t i = 0; i < len; i++) {
-        sprintf(&hex_str[i * 2], "%02x", data[i]);
-    }
-    hex_str[len * 2] = '\0';
-    ESP_LOGI(TAG, "%s: %s", label, hex_str);
-}
-
-static void print_factory_partition(const lwm2m_FactoryPartition* partition) {
-    ESP_LOGI(TAG, "=== Factory Partition Data ===");
-    ESP_LOGI(TAG, "Model: %ld", (long)partition->model);
-    ESP_LOGI(TAG, "Vendor: %ld", (long)partition->vendor);
-    ESP_LOGI(TAG, "Serial: %ld", (long)partition->serial);
-    
-    print_hex_bytes("Public Key", partition->public_key.bytes, partition->public_key.size);
-    print_hex_bytes("Private Key", partition->private_key.bytes, partition->private_key.size);
-    
-    if (partition->bootstrap_server.size > 0) {
-        // Try to print as string (null-terminate safely)
-        char server_str[partition->bootstrap_server.size + 1];
-        memcpy(server_str, partition->bootstrap_server.bytes, partition->bootstrap_server.size);
-        server_str[partition->bootstrap_server.size] = '\0';
-        ESP_LOGI(TAG, "Bootstrap Server: %s", server_str);
-    } else {
-        ESP_LOGI(TAG, "Bootstrap Server: (empty)");
-    }
-    
-    print_hex_bytes("Signature", partition->signature, 64);
-    ESP_LOGI(TAG, "=============================");
-}
-
-// AES key presence now provided by flash_check_aes_key_exists()
-
-static void test_nvs_functionality(void)
-{
-    ESP_LOGI(TAG, "=== Testing NVS Functionality ===");
-    
-    // Initialize NVS
-    esp_err_t err = nvs_flash_init();
-    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_LOGW(TAG, "NVS partition was truncated and will be erased");
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        err = nvs_flash_init();
-    }
-    ESP_ERROR_CHECK(err);
-    
-    nvs_handle_t nvs_handle;
-    err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to open NVS handle: %s", esp_err_to_name(err));
-        return;
-    }
-    
-    // Try to read existing value
-    uint32_t boot_count = 0;
-    size_t required_size = sizeof(boot_count);
-    err = nvs_get_u32(nvs_handle, NVS_TEST_KEY, &boot_count);
-    
-    if (err == ESP_OK) {
-        ESP_LOGI(TAG, "Previous boot count found: %lu", (unsigned long)boot_count);
-    } else if (err == ESP_ERR_NVS_NOT_FOUND) {
-        ESP_LOGI(TAG, "Boot count not found - this appears to be first boot or after factory reset");
-        boot_count = 0;
-    } else {
-        ESP_LOGE(TAG, "Failed to read boot count: %s", esp_err_to_name(err));
-        nvs_close(nvs_handle);
-        return;
-    }
-    
-    // Increment and save boot count
-    boot_count++;
-    err = nvs_set_u32(nvs_handle, NVS_TEST_KEY, boot_count);
-    if (err == ESP_OK) {
-        err = nvs_commit(nvs_handle);
-        if (err == ESP_OK) {
-            ESP_LOGI(TAG, "✓ Boot count updated to: %lu", (unsigned long)boot_count);
-            ESP_LOGI(TAG, "✓ NVS write/read test PASSED");
-        } else {
-            ESP_LOGE(TAG, "Failed to commit NVS: %s", esp_err_to_name(err));
-        }
-    } else {
-        ESP_LOGE(TAG, "Failed to set NVS value: %s", esp_err_to_name(err));
-    }
-    
-    nvs_close(nvs_handle);
-    ESP_LOGI(TAG, "=============================");
-}
 
 void app_main(void)
 {
