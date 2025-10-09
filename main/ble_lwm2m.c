@@ -28,6 +28,8 @@
 #include "esp_random.h"
 
 #include "ble_lwm2m.h"
+#include "lwm2m.pb.h"
+#include "pb_encode.h"
 
 #define LOG_TAG "BLE_LWM2M"
 
@@ -64,9 +66,10 @@ static uint32_t s_sensor_counter = 0;
 
 /* ---------------- BLE / GATT related static data ---------------- */
 static SemaphoreHandle_t s_gap_sem = NULL;
-static TaskHandle_t s_adv_task_handle = NULL;
-static uint32_t s_adv_interval_ms = 0;
-static bool s_started = false;
+static TaskHandle_t s_adv_task_handle = NULL;    /* Handle for the periodic update task */
+static uint32_t s_adv_interval_ms = 0;           /* Desired sensor update interval (ms) */
+static bool s_initialized = false;               /* BLE stack + advertising initialized */
+static bool s_adv_task_running = false;          /* Advert update task run flag */
 
 /* GATT simple RW characteristic (same as demo) */
 #define GATTS_APP_ID 0x55
@@ -179,27 +182,77 @@ static void update_sensor_data(void)
 static void create_sensor_adv_data(uint8_t *adv_data, size_t *data_len)
 {
 	uint8_t pos = 0;
-	/* Flags */
-	adv_data[pos++] = 0x02; adv_data[pos++] = ESP_BLE_AD_TYPE_FLAG; adv_data[pos++] = 0x06;
-	/* TX Power */
-	adv_data[pos++] = 0x02; adv_data[pos++] = ESP_BLE_AD_TYPE_TX_PWR; adv_data[pos++] = 0xeb;
-	/* Manufacturer specific (Company 0xFFFF) + sensor payload (11 bytes) */
-	adv_data[pos++] = 0x0D; /* length */
-	adv_data[pos++] = ESP_BLE_AD_MANUFACTURER_SPECIFIC_TYPE; adv_data[pos++] = 0xFF; adv_data[pos++] = 0xFF;
-	adv_data[pos++] = (uint8_t)(s_sensor.temperature & 0xFF);
-	adv_data[pos++] = (uint8_t)(s_sensor.temperature >> 8);
-	adv_data[pos++] = (uint8_t)(s_sensor.humidity & 0xFF);
-	adv_data[pos++] = (uint8_t)(s_sensor.humidity >> 8);
-	adv_data[pos++] = (uint8_t)(s_sensor.pressure & 0xFF);
-	adv_data[pos++] = (uint8_t)(s_sensor.pressure >> 8);
-	adv_data[pos++] = (uint8_t)(s_sensor.timestamp & 0xFF);
-	adv_data[pos++] = (uint8_t)(s_sensor.timestamp >> 8);
-	adv_data[pos++] = (uint8_t)(s_sensor.timestamp >> 16);
-	/* Name */
-	const char *name = s_aes_key_exists ? "ESP_SENSOR" : "ESP_LWM2M"; /* slight differentiation */
-	uint8_t name_len = strlen(name);
-	adv_data[pos++] = name_len + 1; adv_data[pos++] = ESP_BLE_AD_TYPE_NAME_CMPL;
-	memcpy(&adv_data[pos], name, name_len); pos += name_len;
+	
+	if (!s_aes_key_exists) {
+		/* When AES key doesn't exist, broadcast protobuf LwM2MMessage with Appearance */
+		
+		/* Flags */
+		adv_data[pos++] = 0x02; adv_data[pos++] = ESP_BLE_AD_TYPE_FLAG; adv_data[pos++] = 0x06;
+		/* TX Power */
+		adv_data[pos++] = 0x02; adv_data[pos++] = ESP_BLE_AD_TYPE_TX_PWR; adv_data[pos++] = 0xeb;
+		
+		/* Create protobuf LwM2MMessage with Appearance */
+		lwm2m_LwM2MMessage lwm2m_msg = lwm2m_LwM2MMessage_init_zero;
+		lwm2m_msg.timestamp = s_sensor.timestamp;
+		lwm2m_msg.which_body = lwm2m_LwM2MMessage_appearance_tag;
+		
+		/* Fill appearance data */
+		lwm2m_LwM2MAppearance *appearance = &lwm2m_msg.body.appearance;
+		appearance->model = s_factory_partition && s_factory_partition_valid ? s_factory_partition->model : 1001; /* default model */
+		appearance->serial = s_factory_partition && s_factory_partition_valid ? s_factory_partition->serial : s_sensor.timestamp; /* use timestamp as serial if no factory data */
+		
+
+		/* Encode protobuf to bytes */
+		uint8_t pb_buffer[92]; /* lwm2m_LwM2MMessage_size is 92 bytes max */
+		pb_ostream_t stream = pb_ostream_from_buffer(pb_buffer, sizeof(pb_buffer));
+		
+		if (pb_encode(&stream, lwm2m_LwM2MMessage_fields, &lwm2m_msg)) {
+			/* Manufacturer specific data with protobuf payload */
+			size_t pb_len = stream.bytes_written;
+			if (pos + 4 + pb_len < 31) { /* ensure it fits in BLE advertising packet */
+				adv_data[pos++] = pb_len + 3; /* length of manufacturer data */
+				adv_data[pos++] = ESP_BLE_AD_MANUFACTURER_SPECIFIC_TYPE;
+				adv_data[pos++] = 0xFF; adv_data[pos++] = 0xFF; /* Company ID 0xFFFF */
+				memcpy(&adv_data[pos], pb_buffer, pb_len);
+				pos += pb_len;
+			}
+		} else {
+			ESP_LOGE(LOG_TAG, "Failed to encode protobuf message");
+		}
+		
+		/* Name */
+		const char *name = "ESP_LWM2M";
+		uint8_t name_len = strlen(name);
+		if (pos + name_len + 2 < 31) {
+			adv_data[pos++] = name_len + 1; adv_data[pos++] = ESP_BLE_AD_TYPE_NAME_CMPL;
+			memcpy(&adv_data[pos], name, name_len); pos += name_len;
+		}
+		
+	} else {
+		/* Original sensor data format when AES key exists */
+		/* Flags */
+		adv_data[pos++] = 0x02; adv_data[pos++] = ESP_BLE_AD_TYPE_FLAG; adv_data[pos++] = 0x06;
+		/* TX Power */
+		adv_data[pos++] = 0x02; adv_data[pos++] = ESP_BLE_AD_TYPE_TX_PWR; adv_data[pos++] = 0xeb;
+		/* Manufacturer specific (Company 0xFFFF) + sensor payload (11 bytes) */
+		adv_data[pos++] = 0x0D; /* length */
+		adv_data[pos++] = ESP_BLE_AD_MANUFACTURER_SPECIFIC_TYPE; adv_data[pos++] = 0xFF; adv_data[pos++] = 0xFF;
+		adv_data[pos++] = (uint8_t)(s_sensor.temperature & 0xFF);
+		adv_data[pos++] = (uint8_t)(s_sensor.temperature >> 8);
+		adv_data[pos++] = (uint8_t)(s_sensor.humidity & 0xFF);
+		adv_data[pos++] = (uint8_t)(s_sensor.humidity >> 8);
+		adv_data[pos++] = (uint8_t)(s_sensor.pressure & 0xFF);
+		adv_data[pos++] = (uint8_t)(s_sensor.pressure >> 8);
+		adv_data[pos++] = (uint8_t)(s_sensor.timestamp & 0xFF);
+		adv_data[pos++] = (uint8_t)(s_sensor.timestamp >> 8);
+		adv_data[pos++] = (uint8_t)(s_sensor.timestamp >> 16);
+		/* Name */
+		const char *name = "ESP_SENSOR";
+		uint8_t name_len = strlen(name);
+		adv_data[pos++] = name_len + 1; adv_data[pos++] = ESP_BLE_AD_TYPE_NAME_CMPL;
+		memcpy(&adv_data[pos], name, name_len); pos += name_len;
+	}
+	
 	*data_len = pos;
 }
 
@@ -281,9 +334,11 @@ static void adv_update_task(void *arg)
 	ESP_LOGI(LOG_TAG, "Advertising update task started (interval=%u ms)", (unsigned)s_adv_interval_ms);
 	uint8_t adv_buf[31];
 	size_t adv_len = 0;
-	while (s_started) {
+	while (s_adv_task_running) {
 		update_sensor_data();
 		create_sensor_adv_data(adv_buf, &adv_len);
+		ESP_LOGI(LOG_TAG, "Broadcasting %s data (len=%d bytes)",
+				s_aes_key_exists ? "sensor" : "LwM2M protobuf appearance", (int)adv_len);
 #if CONFIG_BT_BLE_FEAT_PERIODIC_ADV_ENH
 		FUNC_SEND_WAIT_SEM(esp_ble_gap_config_periodic_adv_data_raw(EXT_ADV_HANDLE, adv_len, adv_buf, false), s_gap_sem);
 #else
@@ -294,13 +349,16 @@ static void adv_update_task(void *arg)
 		vTaskDelay(pdMS_TO_TICKS(wait_ms));
 	}
 	ESP_LOGI(LOG_TAG, "Advertising update task exiting");
-	vTaskDelete(NULL);
+	/* Mark handle NULL before deleting so stop routine can return */
+	TaskHandle_t self = s_adv_task_handle;
+	s_adv_task_handle = NULL;
+	vTaskDelete(self);
 }
 
 /* ---------------- Public API Implementations ---------------- */
 esp_err_t ble_lwm2m_init(void)
 {
-	if (s_started) {
+	if (s_initialized) {
 		return ESP_OK; /* already initialized */
 	}
 
@@ -356,7 +414,7 @@ esp_err_t ble_lwm2m_init(void)
 	FUNC_SEND_WAIT_SEM(esp_ble_gap_periodic_adv_start(EXT_ADV_HANDLE), s_gap_sem);
 #endif
 
-	s_started = true;
+	s_initialized = true;
 	ESP_LOGI(LOG_TAG, "BLE LwM2M initialized (periodic advertising active)");
 	return ESP_OK;
 }
@@ -376,7 +434,7 @@ void ble_lwm2m_set_aes_key_status(bool exists)
 
 esp_err_t ble_lwm2m_start_periodic_broadcast(uint32_t interval_ms)
 {
-	if (!s_started) {
+	if (!s_initialized) {
 		ESP_LOGE(LOG_TAG, "BLE not initialized yet");
 		return ESP_ERR_INVALID_STATE;
 	}
@@ -385,18 +443,29 @@ esp_err_t ble_lwm2m_start_periodic_broadcast(uint32_t interval_ms)
 		return ESP_OK;
 	}
 	s_adv_interval_ms = interval_ms;
-	xTaskCreatePinnedToCore(adv_update_task, "ble_adv_upd", 4096, NULL, 5, &s_adv_task_handle, tskNO_AFFINITY);
+	s_adv_task_running = true;
+	if (xTaskCreatePinnedToCore(adv_update_task, "ble_adv_upd", 4096, NULL, 5, &s_adv_task_handle, tskNO_AFFINITY) != pdPASS) {
+		ESP_LOGE(LOG_TAG, "Failed to create advertising update task");
+		s_adv_task_running = false;
+		return ESP_FAIL;
+	}
 	return ESP_OK;
 }
 
 esp_err_t ble_lwm2m_stop_periodic_broadcast(void)
 {
-	if (!s_started) return ESP_ERR_INVALID_STATE;
-	if (s_adv_task_handle) {
-		TaskHandle_t h = s_adv_task_handle; s_adv_task_handle = NULL; s_started = true; /* keep radio */
-		/* Signal task to exit by clearing s_started? we keep advertising; use flag */
-		s_started = true; /* keep BLE active but stop task */
-		vTaskDelete(h); /* abrupt stop */
+	if (!s_initialized) return ESP_ERR_INVALID_STATE;
+	if (!s_adv_task_handle) return ESP_OK; /* already stopped */
+	/* Signal task to exit gracefully */
+	s_adv_task_running = false;
+	/* Wait (bounded) for task to null out its handle */
+	for (int i = 0; i < 50 && s_adv_task_handle; ++i) { /* ~500ms max */
+		vTaskDelay(pdMS_TO_TICKS(10));
+	}
+	if (s_adv_task_handle) { /* Fallback: force delete */
+		ESP_LOGW(LOG_TAG, "Force deleting advertising task");
+		vTaskDelete(s_adv_task_handle);
+		s_adv_task_handle = NULL;
 	}
 	return ESP_OK;
 }
@@ -415,14 +484,18 @@ esp_err_t ble_lwm2m_broadcast_temperature(void)
 
 void ble_lwm2m_deinit(void)
 {
-	if (!s_started) return;
-	s_started = false;
-	if (s_adv_task_handle) {
-		TaskHandle_t h = s_adv_task_handle; s_adv_task_handle = NULL;
-		vTaskDelete(h);
-	}
+	if (!s_initialized) return;
+	/* Stop periodic broadcast task */
+	ble_lwm2m_stop_periodic_broadcast();
+	s_initialized = false;
+	/* Stop periodic + extended advertising */
+#if CONFIG_BT_BLE_FEAT_PERIODIC_ADV_ENH
+	esp_ble_gap_periodic_adv_stop(EXT_ADV_HANDLE, true);
+#else
+	esp_ble_gap_periodic_adv_stop(EXT_ADV_HANDLE);
+#endif
+	esp_ble_gap_ext_adv_stop(NUM_EXT_ADV, &ext_adv[0]);
 	if (s_gap_sem) { vSemaphoreDelete(s_gap_sem); s_gap_sem = NULL; }
-	esp_ble_gap_stop_advertising(); /* legacy stop, extended sets separately */
 	esp_bt_controller_disable();
 	esp_bluedroid_disable();
 	esp_bluedroid_deinit();

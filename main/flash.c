@@ -149,8 +149,8 @@ void flash_debug_print_factory_partition(const lwm2m_FactoryPartition* p, bool v
     }
     ESP_LOGI(TAG, "=== LwM2M Factory Partition ===");
     ESP_LOGI(TAG, "Model: %ld Vendor: %ld Serial: %ld", (long)p->model, (long)p->vendor, (long)p->serial);
-    print_hex_bytes("Public Key", p->public_key.bytes, p->public_key.size);
-    print_hex_bytes("Private Key", p->private_key.bytes, p->private_key.size);
+    print_hex_bytes("Public Key", p->public_key, sizeof(p->public_key));
+    print_hex_bytes("Private Key", p->private_key, sizeof(p->private_key));
     if (p->bootstrap_server.size > 0) {
         char server[p->bootstrap_server.size + 1];
         memcpy(server, p->bootstrap_server.bytes, p->bootstrap_server.size);
