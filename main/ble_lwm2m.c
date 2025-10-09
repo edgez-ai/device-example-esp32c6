@@ -78,8 +78,57 @@ static const uint16_t GATTS_CHAR_RW_UUID = 0xFF01;
 static const uint16_t primary_service_uuid = ESP_GATT_UUID_PRI_SERVICE;
 static const uint16_t character_declaration_uuid = ESP_GATT_UUID_CHAR_DECLARE;
 static uint8_t char_prop_rw = ESP_GATT_CHAR_PROP_BIT_READ | ESP_GATT_CHAR_PROP_BIT_WRITE;
-static uint8_t rw_char_value[20] = "Hello BLE";
+/* Default characteristic value shown to clients that haven't written yet */
+static uint8_t rw_char_value[64] = "Hello BLE";  /* enlarge to hold greeting + name */
 static uint16_t rw_char_value_len = 9;
+
+/* Maintain per-connection values so only the writer sees their updated response */
+#define MAX_CONN 4
+typedef struct {
+	bool in_use;
+	uint16_t conn_id;
+	uint8_t value[64];
+	uint16_t len;
+} conn_ctx_t;
+static conn_ctx_t s_conns[MAX_CONN] = {0};
+
+static conn_ctx_t* find_conn_ctx(uint16_t conn_id)
+{
+	for (int i = 0; i < MAX_CONN; ++i) {
+		if (s_conns[i].in_use && s_conns[i].conn_id == conn_id) return &s_conns[i];
+	}
+	return NULL;
+}
+
+static conn_ctx_t* alloc_conn_ctx(uint16_t conn_id)
+{
+	conn_ctx_t *ctx = find_conn_ctx(conn_id);
+	if (ctx) return ctx;
+	for (int i = 0; i < MAX_CONN; ++i) {
+		if (!s_conns[i].in_use) {
+			s_conns[i].in_use = true;
+			s_conns[i].conn_id = conn_id;
+			/* initialize with default value */
+			memcpy(s_conns[i].value, rw_char_value, rw_char_value_len);
+			s_conns[i].len = rw_char_value_len;
+			return &s_conns[i];
+		}
+	}
+	return NULL; /* no slot */
+}
+
+static void free_conn_ctx(uint16_t conn_id)
+{
+	for (int i = 0; i < MAX_CONN; ++i) {
+		if (s_conns[i].in_use && s_conns[i].conn_id == conn_id) {
+			s_conns[i].in_use = false;
+			s_conns[i].conn_id = 0;
+			memset(s_conns[i].value, 0, sizeof(s_conns[i].value));
+			s_conns[i].len = 0;
+			break;
+		}
+	}
+}
 
 enum {
 	IDX_SVC,
@@ -278,17 +327,44 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
 		esp_gatt_rsp_t rsp = {0};
 		rsp.attr_value.handle = param->read.handle;
 		if (param->read.handle == gatt_handle_table[IDX_CHAR_RW_VAL]) {
-			rsp.attr_value.len = rw_char_value_len;
-			memcpy(rsp.attr_value.value, rw_char_value, rw_char_value_len);
+				/* Return per-connection value if present; otherwise default */
+				conn_ctx_t *ctx = find_conn_ctx(param->read.conn_id);
+				if (ctx && ctx->len > 0) {
+					rsp.attr_value.len = ctx->len;
+					memcpy(rsp.attr_value.value, ctx->value, ctx->len);
+				} else {
+					rsp.attr_value.len = rw_char_value_len;
+					memcpy(rsp.attr_value.value, rw_char_value, rw_char_value_len);
+				}
 		}
 		esp_ble_gatts_send_response(gatts_if, param->read.conn_id, param->read.trans_id, ESP_GATT_OK, &rsp);
 		break; }
 	case ESP_GATTS_WRITE_EVT:
 		if (param->write.handle == gatt_handle_table[IDX_CHAR_RW_VAL]) {
-			size_t wlen = param->write.len > sizeof(rw_char_value) ? sizeof(rw_char_value) : param->write.len;
-			memcpy(rw_char_value, param->write.value, wlen);
-			rw_char_value_len = wlen;
-			ESP_LOGI(LOG_TAG, "Characteristic written (%d bytes)", (int)wlen);
+			/* Build response: "hello " + <written bytes> */
+			static const char prefix[] = "hello ";
+			size_t prefix_len = sizeof(prefix) - 1; /* exclude NUL */
+			size_t max_copy = 0;
+			if (sizeof(((conn_ctx_t*)0)->value) > prefix_len) {
+				max_copy = sizeof(((conn_ctx_t*)0)->value) - prefix_len; /* remaining space after prefix */
+			}
+			size_t in_len = param->write.len;
+			size_t copy_len = in_len < max_copy ? in_len : max_copy;
+			conn_ctx_t *ctx = alloc_conn_ctx(param->write.conn_id);
+			if (ctx) {
+				memcpy(ctx->value, prefix, prefix_len);
+				if (copy_len > 0) {
+					memcpy(ctx->value + prefix_len, param->write.value, copy_len);
+				}
+				ctx->len = prefix_len + copy_len;
+				ESP_LOGI(LOG_TAG, "Conn %u write (%d bytes), per-conn read value -> '%.*s'", (unsigned)param->write.conn_id, (int)in_len, (int)ctx->len, (const char*)ctx->value);
+			} else {
+				/* Fallback to global if no slot available */
+				memcpy(rw_char_value, prefix, prefix_len);
+				if (copy_len > 0) memcpy(rw_char_value + prefix_len, param->write.value, copy_len);
+				rw_char_value_len = prefix_len + copy_len;
+				ESP_LOGW(LOG_TAG, "No free conn slot; using global value for response");
+			}
 		}
 		if (param->write.need_rsp) {
 			esp_gatt_rsp_t rsp = {0};
@@ -298,9 +374,15 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
 		break;
 	case ESP_GATTS_CONNECT_EVT:
 		ESP_LOGI(LOG_TAG, "Client connected, conn_id=%d", param->connect.conn_id);
+		/* Allocate per-connection context */
+		if (!alloc_conn_ctx(param->connect.conn_id)) {
+			ESP_LOGW(LOG_TAG, "No free connection slots for conn_id=%u", (unsigned)param->connect.conn_id);
+		}
 		break;
 	case ESP_GATTS_DISCONNECT_EVT:
 		ESP_LOGI(LOG_TAG, "Client disconnected reason=0x%x", param->disconnect.reason);
+		/* Release per-connection context */
+		free_conn_ctx(param->disconnect.conn_id);
 		/* restart connectable advertising */
 		esp_ble_gap_ext_adv_start(1, &ext_adv[1]);
 		break;
@@ -494,7 +576,9 @@ void ble_lwm2m_deinit(void)
 #else
 	esp_ble_gap_periodic_adv_stop(EXT_ADV_HANDLE);
 #endif
-	esp_ble_gap_ext_adv_stop(NUM_EXT_ADV, &ext_adv[0]);
+	/* Stop both extended advertising instances: periodic (non-connectable) and connectable */
+	uint8_t adv_handles[NUM_EXT_ADV] = { EXT_ADV_HANDLE, CONN_ADV_HANDLE };
+	esp_ble_gap_ext_adv_stop(NUM_EXT_ADV, adv_handles);
 	if (s_gap_sem) { vSemaphoreDelete(s_gap_sem); s_gap_sem = NULL; }
 	esp_bt_controller_disable();
 	esp_bluedroid_disable();
