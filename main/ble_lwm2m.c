@@ -471,14 +471,15 @@ esp_err_t ble_lwm2m_init(void)
 	}
 
 	/* Prepare advertising data / parameters */
+	/* Use SAME random address for both periodic and connectable advertising */
 	esp_bd_addr_t rand_addr; esp_ble_gap_addr_create_static(rand_addr);
 	FUNC_SEND_WAIT_SEM(esp_ble_gap_ext_adv_set_params(EXT_ADV_HANDLE, &ext_adv_params_LR), s_gap_sem);
 	FUNC_SEND_WAIT_SEM(esp_ble_gap_ext_adv_set_rand_addr(EXT_ADV_HANDLE, rand_addr), s_gap_sem);
 	FUNC_SEND_WAIT_SEM(esp_ble_gap_config_ext_adv_data_raw(EXT_ADV_HANDLE, sizeof(raw_ext_adv_data_lr), raw_ext_adv_data_lr), s_gap_sem);
 
-	esp_bd_addr_t conn_rand_addr; esp_ble_gap_addr_create_static(conn_rand_addr);
+	/* IMPORTANT: Use the SAME random address for connectable advertising so gateway can connect after syncing to periodic adv */
 	FUNC_SEND_WAIT_SEM(esp_ble_gap_ext_adv_set_params(CONN_ADV_HANDLE, &conn_adv_params), s_gap_sem);
-	FUNC_SEND_WAIT_SEM(esp_ble_gap_ext_adv_set_rand_addr(CONN_ADV_HANDLE, conn_rand_addr), s_gap_sem);
+	FUNC_SEND_WAIT_SEM(esp_ble_gap_ext_adv_set_rand_addr(CONN_ADV_HANDLE, rand_addr), s_gap_sem);
 	/* Minimal connectable adv data (Flags + Name) */
 	uint8_t conn_adv_data[31]; uint8_t p = 0; const char *cn = "ESP_CONNECT"; uint8_t cn_len = strlen(cn);
 	conn_adv_data[p++] = 0x02; conn_adv_data[p++] = ESP_BLE_AD_TYPE_FLAG; conn_adv_data[p++] = 0x06;
