@@ -157,7 +157,6 @@ void flash_debug_print_factory_partition(const lwm2m_FactoryPartition* p, bool v
         server[p->bootstrap_server.size] = '\0';
         ESP_LOGI(TAG, "Bootstrap Server: %s", server);
     }
-    print_hex_bytes("Signature", p->signature, 64);
     ESP_LOGI(TAG, "================================");
 }
 
