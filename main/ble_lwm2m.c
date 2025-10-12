@@ -30,6 +30,7 @@
 #include "ble_lwm2m.h"
 #include "lwm2m.pb.h"
 #include "pb_encode.h"
+#include <mbedtls/aes.h>
 
 #define LOG_TAG "BLE_LWM2M"
 
@@ -128,6 +129,55 @@ static void free_conn_ctx(uint16_t conn_id)
 			break;
 		}
 	}
+}
+
+/* ---------------- Simple AES-256 ECB PKCS7 encryption helper ----------------
+ * NOTE: ECB is used here for simplicity because the requirement only asked to
+ * "respond with AES encryption". For production use, prefer an authenticated
+ * mode (e.g. AES-GCM) or at least CBC with a random IV transmitted alongside.
+ * Output buffer must have capacity for padded length ( (in_len+pad) ).
+ */
+static bool encrypt_aes256_ecb_pkcs7(const uint8_t *key32,
+									 const uint8_t *in, size_t in_len,
+									 uint8_t *out, size_t *out_len,
+									 size_t out_cap)
+{
+	if (!key32 || !in || !out || !out_len) return false;
+	const size_t block = 16;
+	if (out_cap < block) return false;
+	/* Make sure padded size fits */
+	size_t pad_len = block - (in_len % block);
+	size_t padded = in_len + pad_len;
+	if (padded > out_cap) {
+		/* Truncate plaintext so that after padding it fits */
+		size_t max_plain = (out_cap / block) * block; /* full blocks capacity */
+		if (max_plain == 0) return false;
+		/* leave room for at least one padding block */
+		if (in_len > max_plain - block) in_len = max_plain - block;
+		pad_len = block - (in_len % block);
+		padded = in_len + pad_len;
+	}
+	uint8_t buf[64]; /* temporary block buffer (max characteristic size) */
+	if (padded > sizeof(buf)) return false; /* safety */
+	memcpy(buf, in, in_len);
+	/* PKCS7 padding */
+	memset(buf + in_len, (uint8_t)pad_len, pad_len);
+
+	mbedtls_aes_context ctx;
+	mbedtls_aes_init(&ctx);
+	if (mbedtls_aes_setkey_enc(&ctx, key32, 256) != 0) {
+		mbedtls_aes_free(&ctx);
+		return false;
+	}
+	for (size_t off = 0; off < padded; off += block) {
+		if (mbedtls_aes_crypt_ecb(&ctx, MBEDTLS_AES_ENCRYPT, buf + off, out + off) != 0) {
+			mbedtls_aes_free(&ctx);
+			return false;
+		}
+	}
+	mbedtls_aes_free(&ctx);
+	*out_len = padded;
+	return true;
 }
 
 enum {
@@ -341,29 +391,33 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
 		break; }
 	case ESP_GATTS_WRITE_EVT:
 		if (param->write.handle == gatt_handle_table[IDX_CHAR_RW_VAL]) {
-			/* Build response: "hello " + <written bytes> */
-			static const char prefix[] = "hello ";
-			size_t prefix_len = sizeof(prefix) - 1; /* exclude NUL */
-			size_t max_copy = 0;
-			if (sizeof(((conn_ctx_t*)0)->value) > prefix_len) {
-				max_copy = sizeof(((conn_ctx_t*)0)->value) - prefix_len; /* remaining space after prefix */
+			/* Encrypt the written value using AES-256 (factory partition private_key) */
+			const uint8_t *key = NULL;
+			if (s_factory_partition && s_factory_partition_valid) {
+				key = s_factory_partition->private_key; /* 32 bytes per proto definition */
 			}
-			size_t in_len = param->write.len;
-			size_t copy_len = in_len < max_copy ? in_len : max_copy;
 			conn_ctx_t *ctx = alloc_conn_ctx(param->write.conn_id);
-			if (ctx) {
-				memcpy(ctx->value, prefix, prefix_len);
-				if (copy_len > 0) {
-					memcpy(ctx->value + prefix_len, param->write.value, copy_len);
-				}
-				ctx->len = prefix_len + copy_len;
-				ESP_LOGI(LOG_TAG, "Conn %u write (%d bytes), per-conn read value -> '%.*s'", (unsigned)param->write.conn_id, (int)in_len, (int)ctx->len, (const char*)ctx->value);
+			uint8_t *out_buf = ctx ? ctx->value : rw_char_value;
+			size_t out_cap = ctx ? sizeof(ctx->value) : sizeof(rw_char_value);
+			size_t enc_len = 0;
+			bool ok = false;
+			if (key) {
+				ok = encrypt_aes256_ecb_pkcs7(key, param->write.value, param->write.len, out_buf, &enc_len, out_cap);
 			} else {
-				/* Fallback to global if no slot available */
-				memcpy(rw_char_value, prefix, prefix_len);
-				if (copy_len > 0) memcpy(rw_char_value + prefix_len, param->write.value, copy_len);
-				rw_char_value_len = prefix_len + copy_len;
-				ESP_LOGW(LOG_TAG, "No free conn slot; using global value for response");
+				ESP_LOGW(LOG_TAG, "Factory partition/key unavailable; returning zero length");
+			}
+			if (ok) {
+				if (ctx) {
+					ctx->len = enc_len;
+					ESP_LOGI(LOG_TAG, "Conn %u write (%d bytes) -> AES-256 encrypted len=%d", (unsigned)param->write.conn_id, (int)param->write.len, (int)enc_len);
+				} else {
+					rw_char_value_len = enc_len;
+					ESP_LOGW(LOG_TAG, "No free conn slot; stored encrypted data globally (len=%d)", (int)enc_len);
+				}
+			} else {
+				/* Failure: zero length response */
+				if (ctx) ctx->len = 0; else rw_char_value_len = 0;
+				ESP_LOGE(LOG_TAG, "AES encryption failed (conn %u)", (unsigned)param->write.conn_id);
 			}
 		}
 		if (param->write.need_rsp) {
