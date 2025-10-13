@@ -297,8 +297,8 @@ static void create_sensor_adv_data(uint8_t *adv_data, size_t *data_len)
 		
 		/* Fill appearance data */
 		lwm2m_LwM2MAppearance *appearance = &lwm2m_msg.body.appearance;
-		appearance->model = s_factory_partition && s_factory_partition_valid ? s_factory_partition->model : 1001; /* default model */
-		appearance->serial = s_factory_partition && s_factory_partition_valid ? s_factory_partition->serial : s_sensor.timestamp; /* use timestamp as serial if no factory data */
+		appearance->model =  1001; /* default model */
+		appearance->serial =  s_sensor.timestamp; /* use timestamp as serial if no factory data */
 		
 
 		/* Encode protobuf to bytes */
@@ -394,7 +394,7 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
 			/* Encrypt the written value using AES-256 (factory partition private_key) */
 			const uint8_t *key = NULL;
 			if (s_factory_partition && s_factory_partition_valid) {
-				key = s_factory_partition->private_key; /* 32 bytes per proto definition */
+				key = s_factory_partition->private_key.bytes; /* 32 bytes per proto definition */
 			}
 			conn_ctx_t *ctx = alloc_conn_ctx(param->write.conn_id);
 			uint8_t *out_buf = ctx ? ctx->value : rw_char_value;
