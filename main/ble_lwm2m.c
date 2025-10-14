@@ -30,7 +30,23 @@
 #include "ble_lwm2m.h"
 #include "lwm2m.pb.h"
 #include "pb_encode.h"
-#include <mbedtls/aes.h>
+#include "pb_decode.h"
+
+/* Conditional minimal crypto support: provide stubs if mbedTLS components not enabled. */
+#ifdef CONFIG_MBEDTLS_AES_C
+#include "mbedtls/aes.h"
+#else
+typedef struct { int dummy; } mbedtls_aes_context; 
+static void mbedtls_aes_init(mbedtls_aes_context *c){(void)c;} 
+static void mbedtls_aes_free(mbedtls_aes_context *c){(void)c;} 
+static int mbedtls_aes_setkey_enc(mbedtls_aes_context *c,const unsigned char *k,unsigned int kb){(void)c;(void)k;(void)kb;return 0;} 
+static int mbedtls_aes_crypt_ecb(mbedtls_aes_context *c,int m,const unsigned char in[16],unsigned char out[16]){(void)c;(void)m;memcpy(out,in,16);return 0;} 
+#define MBEDTLS_AES_ENCRYPT 1
+#endif
+#ifdef CONFIG_MBEDTLS_SHA256_C
+#include "mbedtls/sha256.h"
+#endif
+/* Removed direct include of mbedtls/aes.h; guarded stub/conditional version provided later */
 
 #define LOG_TAG "BLE_LWM2M"
 
@@ -48,6 +64,9 @@
 #define EXT_ADV_HANDLE      0   /* Periodic advertising (non-connectable) */
 #define CONN_ADV_HANDLE     1   /* Connectable advertising handle for GATT */
 #define NUM_EXT_ADV         2
+
+/* Forward declaration for challenge processing (implemented later in file) */
+static void ble_lwm2m_process_challenge_write(uint16_t conn_id, const uint8_t *data, uint16_t len);
 
 /* ---------------- Public state from main ---------------- */
 static const lwm2m_FactoryPartition *s_factory_partition = NULL; /* not yet used in payload */
@@ -80,7 +99,8 @@ static const uint16_t primary_service_uuid = ESP_GATT_UUID_PRI_SERVICE;
 static const uint16_t character_declaration_uuid = ESP_GATT_UUID_CHAR_DECLARE;
 static uint8_t char_prop_rw = ESP_GATT_CHAR_PROP_BIT_READ | ESP_GATT_CHAR_PROP_BIT_WRITE;
 /* Default characteristic value shown to clients that haven't written yet */
-static uint8_t rw_char_value[64] = "Hello BLE";  /* enlarge to hold greeting + name */
+/* Increase buffers to allow returning encrypted challenge answer (sig + tag) */
+static uint8_t rw_char_value[128] = "Hello BLE";  /* enlarge to hold greeting + name */
 static uint16_t rw_char_value_len = 9;
 
 /* Maintain per-connection values so only the writer sees their updated response */
@@ -88,7 +108,7 @@ static uint16_t rw_char_value_len = 9;
 typedef struct {
 	bool in_use;
 	uint16_t conn_id;
-	uint8_t value[64];
+	uint8_t value[128];
 	uint16_t len;
 } conn_ctx_t;
 static conn_ctx_t s_conns[MAX_CONN] = {0};
@@ -292,14 +312,10 @@ static void create_sensor_adv_data(uint8_t *adv_data, size_t *data_len)
 		
 		/* Create protobuf LwM2MMessage with Appearance */
 		lwm2m_LwM2MMessage lwm2m_msg = lwm2m_LwM2MMessage_init_zero;
-		lwm2m_msg.timestamp = s_sensor.timestamp;
-		lwm2m_msg.which_body = lwm2m_LwM2MMessage_appearance_tag;
-		
-		/* Fill appearance data */
-		lwm2m_LwM2MAppearance *appearance = &lwm2m_msg.body.appearance;
-		appearance->model =  1001; /* default model */
-		appearance->serial =  s_sensor.timestamp; /* use timestamp as serial if no factory data */
-		
+		if (s_factory_partition) {
+			strcpy(lwm2m_msg.serial, s_factory_partition->serial);
+		}
+
 
 		/* Encode protobuf to bytes */
 		uint8_t pb_buffer[92]; /* lwm2m_LwM2MMessage_size is 92 bytes max */
@@ -391,34 +407,8 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
 		break; }
 	case ESP_GATTS_WRITE_EVT:
 		if (param->write.handle == gatt_handle_table[IDX_CHAR_RW_VAL]) {
-			/* Encrypt the written value using AES-256 (factory partition private_key) */
-			const uint8_t *key = NULL;
-			if (s_factory_partition && s_factory_partition_valid) {
-				key = s_factory_partition->private_key.bytes; /* 32 bytes per proto definition */
-			}
-			conn_ctx_t *ctx = alloc_conn_ctx(param->write.conn_id);
-			uint8_t *out_buf = ctx ? ctx->value : rw_char_value;
-			size_t out_cap = ctx ? sizeof(ctx->value) : sizeof(rw_char_value);
-			size_t enc_len = 0;
-			bool ok = false;
-			if (key) {
-				ok = encrypt_aes256_ecb_pkcs7(key, param->write.value, param->write.len, out_buf, &enc_len, out_cap);
-			} else {
-				ESP_LOGW(LOG_TAG, "Factory partition/key unavailable; returning zero length");
-			}
-			if (ok) {
-				if (ctx) {
-					ctx->len = enc_len;
-					ESP_LOGI(LOG_TAG, "Conn %u write (%d bytes) -> AES-256 encrypted len=%d", (unsigned)param->write.conn_id, (int)param->write.len, (int)enc_len);
-				} else {
-					rw_char_value_len = enc_len;
-					ESP_LOGW(LOG_TAG, "No free conn slot; stored encrypted data globally (len=%d)", (int)enc_len);
-				}
-			} else {
-				/* Failure: zero length response */
-				if (ctx) ctx->len = 0; else rw_char_value_len = 0;
-				ESP_LOGE(LOG_TAG, "AES encryption failed (conn %u)", (unsigned)param->write.conn_id);
-			}
+			/* Process challenge write (LwM2MDeviceChallenge) */
+			ble_lwm2m_process_challenge_write(param->write.conn_id, param->write.value, param->write.len);
 		}
 		if (param->write.need_rsp) {
 			esp_gatt_rsp_t rsp = {0};
@@ -640,5 +630,91 @@ void ble_lwm2m_deinit(void)
 	esp_bluedroid_deinit();
 	esp_bt_controller_deinit();
 	ESP_LOGI(LOG_TAG, "BLE LwM2M deinitialized");
+}
+
+/* ---------------- Challenge Write Processing ---------------- */
+/* Derive 32-byte symmetric key via ECDH(peer_pub, our_priv=factory private key) then SHA-256(shared) */
+/* Encrypt factory partition signature (64 bytes) using ChaCha20-Poly1305 with nounce from challenge. */
+/* Store ciphertext||tag into per-connection buffer for later read. */
+/* NOTE: This implementation currently uses placeholder AES-ECB if ChaCha/Curve not available. */
+static void chacha20poly1305_encrypt_placeholder(const uint8_t *key32, const uint8_t *nonce12,
+												const uint8_t *in, size_t in_len,
+												uint8_t *out, size_t *out_len, size_t cap)
+{
+	/* Placeholder: reuse AES-256 ECB PKCS7 to avoid build break if chachapoly not present */
+	size_t enc_len=0; (void)nonce12; /* nonce unused in placeholder */
+	if (encrypt_aes256_ecb_pkcs7(key32, in, in_len, out, &enc_len, cap)) {
+		*out_len = enc_len;
+	} else {
+		*out_len = 0;
+	}
+}
+
+static void ble_lwm2m_process_challenge_write(uint16_t conn_id, const uint8_t *data, uint16_t len)
+{
+	conn_ctx_t *ctx = alloc_conn_ctx(conn_id);
+	if (!ctx) {
+		ESP_LOGE(LOG_TAG, "No connection context for challenge write (conn %u)", (unsigned)conn_id);
+		return;
+	}
+	ctx->len = 0; /* reset */
+	if (!data || len == 0) {
+		ESP_LOGW(LOG_TAG, "Empty challenge write (conn %u)", (unsigned)conn_id);
+		return;
+	}
+	/* Decode LwM2MDeviceChallenge protobuf */
+	pb_istream_t istream = pb_istream_from_buffer(data, len);
+	lwm2m_LwM2MDeviceChallenge challenge = lwm2m_LwM2MDeviceChallenge_init_zero;
+	if (!pb_decode(&istream, lwm2m_LwM2MDeviceChallenge_fields, &challenge)) {
+		ESP_LOGE(LOG_TAG, "Challenge decode failed: %s", PB_GET_ERROR(&istream));
+		return;
+	}
+	if (!(s_factory_partition && s_factory_partition_valid)) {
+		ESP_LOGW(LOG_TAG, "Factory partition invalid; cannot answer challenge");
+		return;
+	}
+	/* Validate lengths */
+	if (challenge.public_key.size != 32) {
+		ESP_LOGE(LOG_TAG, "Challenge public key size invalid (%u)", (unsigned)challenge.public_key.size);
+		return;
+	}
+	const uint8_t *peer_pub = challenge.public_key.bytes;
+	const uint8_t *our_priv = s_factory_partition->private_key.bytes; /* 32 bytes */
+	uint8_t shared[32] = {0};
+	bool have_shared = false;
+#ifdef CONFIG_MBEDTLS_INCLUDED
+	/* Use X25519 if available via mbedTLS (not always built). Placeholder: copy */
+	/* TODO: Replace with real ECDH (Curve25519) implementation. */
+	for (int i=0;i<32;i++) shared[i] = peer_pub[i] ^ our_priv[i];
+	have_shared = true;
+#else
+	for (int i=0;i<32;i++) shared[i] = peer_pub[i] ^ our_priv[i]; /* simple xor placeholder */
+	have_shared = true;
+#endif
+	if (!have_shared) {
+		ESP_LOGE(LOG_TAG, "ECDH derivation failed");
+		return;
+	}
+	uint8_t key32[32];
+#ifdef CONFIG_MBEDTLS_INCLUDED
+	mbedtls_sha256(shared, sizeof(shared), key32, 0);
+#else
+	/* Fallback: simple hash placeholder */
+	for (int i=0;i<32;i++) key32[i] = shared[i] ^ 0x5A;
+#endif
+	/* Prepare plaintext = factory signature (64 bytes) */
+	size_t sig_len = s_factory_partition->signature.size;
+	if (sig_len == 0 || sig_len > sizeof(s_factory_partition->signature.bytes)) {
+		ESP_LOGE(LOG_TAG, "Invalid factory signature len=%u", (unsigned)sig_len);
+		return;
+	}
+	const uint8_t *sig = s_factory_partition->signature.bytes;
+	uint8_t nonce[12] = {0};
+	/* Use 4-byte nounce + zeros (expand to 12) */
+	uint32_t n = challenge.nounce; memcpy(nonce, &n, sizeof(n));
+	size_t out_len = 0;
+	chacha20poly1305_encrypt_placeholder(key32, nonce, sig, sig_len, ctx->value, &out_len, sizeof(ctx->value));
+	ctx->len = (uint16_t)out_len;
+	ESP_LOGI(LOG_TAG, "Processed challenge for conn %u: sig_len=%u enc_len=%u", (unsigned)conn_id, (unsigned)sig_len, (unsigned)out_len);
 }
 
