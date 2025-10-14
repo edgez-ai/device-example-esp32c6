@@ -313,7 +313,8 @@ static void create_sensor_adv_data(uint8_t *adv_data, size_t *data_len)
 		/* Create protobuf LwM2MMessage with Appearance */
 		lwm2m_LwM2MMessage lwm2m_msg = lwm2m_LwM2MMessage_init_zero;
 		if (s_factory_partition) {
-			strcpy(lwm2m_msg.serial, s_factory_partition->serial);
+			lwm2m_msg.serial = s_factory_partition->serial_number;
+			lwm2m_msg.model = s_factory_partition->model;
 		}
 
 
