@@ -50,6 +50,13 @@ static int mbedtls_aes_crypt_ecb(mbedtls_aes_context *c,int m,const unsigned cha
 #include "mbedtls/ecdh.h"
 #include "mbedtls/ecp.h"
 #endif
+#if defined(CONFIG_MBEDTLS_CHACHA20_C) && defined(CONFIG_MBEDTLS_POLY1305_C)
+#include "mbedtls/chacha20.h"
+#include "mbedtls/poly1305.h"
+#define HAS_CHACHA20_POLY1305 1
+#else
+#define HAS_CHACHA20_POLY1305 0
+#endif
 /* Removed direct include of mbedtls/aes.h; guarded stub/conditional version provided later */
 
 #define LOG_TAG "BLE_LWM2M"
@@ -642,21 +649,141 @@ void ble_lwm2m_deinit(void)
 }
 
 /* ---------------- Challenge Write Processing ---------------- */
+/* ---------------- ChaCha20-Poly1305 AEAD Encryption ---------------- */
 /* Derive 32-byte symmetric key via ECDH(peer_pub, our_priv=factory private key) then SHA-256(shared) */
-/* Encrypt factory partition signature (64 bytes) using ChaCha20-Poly1305 with nounce from challenge. */
+/* Encrypt factory partition signature (64 bytes) using ChaCha20-Poly1305 with nonce from challenge. */
 /* Store ciphertext||tag into per-connection buffer for later read. */
-/* NOTE: This implementation currently uses placeholder AES-ECB if ChaCha/Curve not available. */
-static void chacha20poly1305_encrypt_placeholder(const uint8_t *key32, const uint8_t *nonce12,
-												const uint8_t *in, size_t in_len,
-												uint8_t *out, size_t *out_len, size_t cap)
+static bool chacha20poly1305_encrypt(const uint8_t *key32, const uint32_t nonce32,
+									const uint8_t *in, size_t in_len,
+									uint8_t *out, size_t *out_len, size_t cap)
 {
-	/* Placeholder: reuse AES-256 ECB PKCS7 to avoid build break if chachapoly not present */
-	size_t enc_len=0; (void)nonce12; /* nonce unused in placeholder */
+	if (!key32 || !in || !out || !out_len) return false;
+	
+	/* Need space for ciphertext + 16-byte Poly1305 tag */
+	if (cap < in_len + 16) {
+		ESP_LOGE(LOG_TAG, "Output buffer too small: need %u, have %u", 
+				 (unsigned)(in_len + 16), (unsigned)cap);
+		return false;
+	}
+
+#if HAS_CHACHA20_POLY1305
+	ESP_LOGI(LOG_TAG, "Using ChaCha20-Poly1305 AEAD encryption");
+	
+	/* Construct 12-byte nonce: 8 bytes zeros + 4 bytes from challenge nonce */
+	uint8_t nonce12[12] = {0};
+	/* Place the 32-bit nonce in little-endian at offset 8 */
+	nonce12[8] = (nonce32 >> 0) & 0xFF;
+	nonce12[9] = (nonce32 >> 8) & 0xFF;
+	nonce12[10] = (nonce32 >> 16) & 0xFF;
+	nonce12[11] = (nonce32 >> 24) & 0xFF;
+	
+	ESP_LOG_BUFFER_HEX_LEVEL(LOG_TAG, nonce12, 12, ESP_LOG_DEBUG);
+	
+	/* Initialize ChaCha20 context */
+	mbedtls_chacha20_context chacha_ctx;
+	mbedtls_chacha20_init(&chacha_ctx);
+	
+	int ret = mbedtls_chacha20_setkey(&chacha_ctx, key32);
+	if (ret != 0) {
+		ESP_LOGE(LOG_TAG, "ChaCha20 setkey failed: -0x%04x", -ret);
+		mbedtls_chacha20_free(&chacha_ctx);
+		return false;
+	}
+	
+	ret = mbedtls_chacha20_starts(&chacha_ctx, nonce12, 1); /* counter starts at 1 for AEAD */
+	if (ret != 0) {
+		ESP_LOGE(LOG_TAG, "ChaCha20 starts failed: -0x%04x", -ret);
+		mbedtls_chacha20_free(&chacha_ctx);
+		return false;
+	}
+	
+	/* Encrypt the plaintext */
+	ret = mbedtls_chacha20_update(&chacha_ctx, in_len, in, out);
+	if (ret != 0) {
+		ESP_LOGE(LOG_TAG, "ChaCha20 encrypt failed: -0x%04x", -ret);
+		mbedtls_chacha20_free(&chacha_ctx);
+		return false;
+	}
+	
+	mbedtls_chacha20_free(&chacha_ctx);
+	
+	/* Generate Poly1305 authentication tag */
+	mbedtls_poly1305_context poly_ctx;
+	mbedtls_poly1305_init(&poly_ctx);
+	
+	/* Derive Poly1305 key from ChaCha20 with counter 0 */
+	uint8_t poly_key[32];
+	mbedtls_chacha20_init(&chacha_ctx);
+	ret = mbedtls_chacha20_setkey(&chacha_ctx, key32);
+	if (ret != 0) {
+		ESP_LOGE(LOG_TAG, "ChaCha20 setkey for Poly1305 key failed: -0x%04x", -ret);
+		mbedtls_chacha20_free(&chacha_ctx);
+		mbedtls_poly1305_free(&poly_ctx);
+		return false;
+	}
+	
+	ret = mbedtls_chacha20_starts(&chacha_ctx, nonce12, 0); /* counter 0 for Poly1305 key */
+	if (ret != 0) {
+		ESP_LOGE(LOG_TAG, "ChaCha20 starts for Poly1305 key failed: -0x%04x", -ret);
+		mbedtls_chacha20_free(&chacha_ctx);
+		mbedtls_poly1305_free(&poly_ctx);
+		return false;
+	}
+	
+	memset(poly_key, 0, 32);
+	ret = mbedtls_chacha20_update(&chacha_ctx, 32, poly_key, poly_key);
+	if (ret != 0) {
+		ESP_LOGE(LOG_TAG, "ChaCha20 Poly1305 key generation failed: -0x%04x", -ret);
+		mbedtls_chacha20_free(&chacha_ctx);
+		mbedtls_poly1305_free(&poly_ctx);
+		return false;
+	}
+	
+	mbedtls_chacha20_free(&chacha_ctx);
+	
+	/* Initialize Poly1305 with the derived key */
+	ret = mbedtls_poly1305_starts(&poly_ctx, poly_key);
+	if (ret != 0) {
+		ESP_LOGE(LOG_TAG, "Poly1305 starts failed: -0x%04x", -ret);
+		mbedtls_poly1305_free(&poly_ctx);
+		return false;
+	}
+	
+	/* No additional authenticated data (AAD) in this implementation */
+	/* Authenticate the ciphertext */
+	ret = mbedtls_poly1305_update(&poly_ctx, out, in_len);
+	if (ret != 0) {
+		ESP_LOGE(LOG_TAG, "Poly1305 update failed: -0x%04x", -ret);
+		mbedtls_poly1305_free(&poly_ctx);
+		return false;
+	}
+	
+	/* Finalize and get the authentication tag */
+	ret = mbedtls_poly1305_finish(&poly_ctx, &out[in_len]);
+	mbedtls_poly1305_free(&poly_ctx);
+	
+	if (ret != 0) {
+		ESP_LOGE(LOG_TAG, "Poly1305 finish failed: -0x%04x", -ret);
+		return false;
+	}
+	
+	*out_len = in_len + 16; /* ciphertext + 16-byte tag */
+	ESP_LOGI(LOG_TAG, "ChaCha20-Poly1305 encryption successful: %u->%u bytes", 
+			 (unsigned)in_len, (unsigned)*out_len);
+	return true;
+	
+#else
+	/* Fallback: use AES-256 ECB PKCS7 if ChaCha20-Poly1305 not available */
+	ESP_LOGW(LOG_TAG, "ChaCha20-Poly1305 not available, using AES-256 ECB fallback");
+	size_t enc_len = 0;
 	if (encrypt_aes256_ecb_pkcs7(key32, in, in_len, out, &enc_len, cap)) {
 		*out_len = enc_len;
+		return true;
 	} else {
 		*out_len = 0;
+		return false;
 	}
+#endif
 }
 
 static void ble_lwm2m_process_challenge_write(uint16_t conn_id, const uint8_t *data, uint16_t len)
@@ -774,14 +901,15 @@ key_derivation_done:
 		return;
 	}
 	const uint8_t *sig = s_factory_partition->signature.bytes;
-	uint8_t nonce[12] = {0};
-	/* Use 4-byte nounce + zeros (expand to 12) */
-	uint32_t n = challenge.nounce;
-	memcpy(nonce, &n, sizeof(n));
 
 	size_t out_len = 0;
-	chacha20poly1305_encrypt_placeholder(key32, nonce, sig, sig_len, ctx->value, &out_len, sizeof(ctx->value));
-	ctx->len = (uint16_t)out_len;
-	ESP_LOGI(LOG_TAG, "Processed challenge for conn %u: sig_len=%u enc_len=%u", (unsigned)conn_id, (unsigned)sig_len, (unsigned)out_len);
+	if (chacha20poly1305_encrypt(key32, challenge.nounce, sig, sig_len, ctx->value, &out_len, sizeof(ctx->value))) {
+		ctx->len = (uint16_t)out_len;
+		ESP_LOGI(LOG_TAG, "Processed challenge for conn %u: sig_len=%u enc_len=%u", 
+				 (unsigned)conn_id, (unsigned)sig_len, (unsigned)out_len);
+	} else {
+		ESP_LOGE(LOG_TAG, "Challenge encryption failed for conn %u", (unsigned)conn_id);
+		ctx->len = 0;
+	}
 }
 
