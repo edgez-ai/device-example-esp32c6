@@ -43,8 +43,8 @@ static int mbedtls_aes_setkey_enc(mbedtls_aes_context *c,const unsigned char *k,
 static int mbedtls_aes_crypt_ecb(mbedtls_aes_context *c,int m,const unsigned char in[16],unsigned char out[16]){(void)c;(void)m;memcpy(out,in,16);return 0;} 
 #define MBEDTLS_AES_ENCRYPT 1
 #endif
-#ifdef CONFIG_MBEDTLS_SHA256_C
-#include "mbedtls/sha256.h"
+#ifdef CONFIG_MBEDTLS_SHA512_C
+#include "mbedtls/sha512.h"
 #endif
 #ifdef CONFIG_MBEDTLS_ECDH_C
 #include "mbedtls/ecdh.h"
@@ -697,69 +697,73 @@ static void ble_lwm2m_process_challenge_write(uint16_t conn_id, const uint8_t *d
 
 	uint8_t key32[32];
 	
-	/* Derive shared secret using SHA-256 based key derivation */
-	/* Since we have both keys as 32-byte values, we'll use HKDF-like approach with SHA-256 */
-#ifdef CONFIG_MBEDTLS_SHA256_C
-	ESP_LOGI(LOG_TAG, "Using SHA-256 based key derivation");
+	/* Derive shared secret using SHA-512 based key derivation */
+	/* Since we have both keys as 32-byte values, we'll use HKDF-like approach with SHA-512 */
+#ifdef CONFIG_MBEDTLS_SHA512_C
+	ESP_LOGI(LOG_TAG, "Using SHA-512 based key derivation");
 	
-	/* Combine the keys using SHA-256(our_priv || peer_pub || "ECDH_KEY") */
-	mbedtls_sha256_context sha_ctx;
-	mbedtls_sha256_init(&sha_ctx);
-	int ret = mbedtls_sha256_starts(&sha_ctx, 0); /* 0 = SHA-256 */
+	/* Combine the keys using SHA-512(our_priv || peer_pub || "ECDH_KEY") */
+	mbedtls_sha512_context sha_ctx;
+	mbedtls_sha512_init(&sha_ctx);
+	int ret = mbedtls_sha512_starts(&sha_ctx, 0); /* 0 = SHA-512 (not SHA-384) */
 	if (ret != 0) {
-		ESP_LOGE(LOG_TAG, "SHA256 start failed: -0x%04x", -ret);
-		mbedtls_sha256_free(&sha_ctx);
+		ESP_LOGE(LOG_TAG, "SHA512 start failed: -0x%04x", -ret);
+		mbedtls_sha512_free(&sha_ctx);
 		goto fallback_key_derivation;
 	}
 	
 	/* Hash our private key */
-	ret = mbedtls_sha256_update(&sha_ctx, our_priv, 32);
+	ret = mbedtls_sha512_update(&sha_ctx, our_priv, 32);
 	if (ret != 0) {
-		ESP_LOGE(LOG_TAG, "SHA256 update private key failed: -0x%04x", -ret);
-		mbedtls_sha256_free(&sha_ctx);
+		ESP_LOGE(LOG_TAG, "SHA512 update private key failed: -0x%04x", -ret);
+		mbedtls_sha512_free(&sha_ctx);
 		goto fallback_key_derivation;
 	}
 	
 	/* Hash peer public key */
-	ret = mbedtls_sha256_update(&sha_ctx, peer_pub, 32);
+	ret = mbedtls_sha512_update(&sha_ctx, peer_pub, 32);
 	if (ret != 0) {
-		ESP_LOGE(LOG_TAG, "SHA256 update public key failed: -0x%04x", -ret);
-		mbedtls_sha256_free(&sha_ctx);
+		ESP_LOGE(LOG_TAG, "SHA512 update public key failed: -0x%04x", -ret);
+		mbedtls_sha512_free(&sha_ctx);
 		goto fallback_key_derivation;
 	}
 	
 	/* Add a salt/label for key derivation */
 	const char *label = "BLE_LWM2M_ECDH_KEY_V1";
-	ret = mbedtls_sha256_update(&sha_ctx, (const unsigned char*)label, strlen(label));
+	ret = mbedtls_sha512_update(&sha_ctx, (const unsigned char*)label, strlen(label));
 	if (ret != 0) {
-		ESP_LOGE(LOG_TAG, "SHA256 update label failed: -0x%04x", -ret);
-		mbedtls_sha256_free(&sha_ctx);
+		ESP_LOGE(LOG_TAG, "SHA512 update label failed: -0x%04x", -ret);
+		mbedtls_sha512_free(&sha_ctx);
 		goto fallback_key_derivation;
 	}
 	
-	/* Finalize hash to get derived key */
-	ret = mbedtls_sha256_finish(&sha_ctx, key32);
-	mbedtls_sha256_free(&sha_ctx);
+	/* Finalize hash to get derived key - SHA-512 produces 64 bytes, truncate to 32 */
+	uint8_t sha512_output[64];
+	ret = mbedtls_sha512_finish(&sha_ctx, sha512_output);
+	mbedtls_sha512_free(&sha_ctx);
 	
 	if (ret != 0) {
-		ESP_LOGE(LOG_TAG, "SHA256 finish failed: -0x%04x", -ret);
+		ESP_LOGE(LOG_TAG, "SHA512 finish failed: -0x%04x", -ret);
 		goto fallback_key_derivation;
 	}
 	
-	ESP_LOGI(LOG_TAG, "SHA-256 key derivation successful");
+	/* Use first 32 bytes of SHA-512 output as the derived key */
+	memcpy(key32, sha512_output, 32);
+	
+	ESP_LOGI(LOG_TAG, "SHA-512 key derivation successful");
 	ESP_LOG_BUFFER_HEX_LEVEL(LOG_TAG, key32, 32, ESP_LOG_DEBUG);
 	goto key_derivation_done;
 	
 fallback_key_derivation:
 #endif
-	/* Fallback: use simple XOR combination if SHA256 not available or failed */
+	/* Fallback: use simple XOR combination if SHA512 not available or failed */
 	ESP_LOGW(LOG_TAG, "Using fallback key derivation");
 	for (int i = 0; i < 32; i++) {
 		key32[i] = our_priv[i] ^ peer_pub[i];
 	}
 	ESP_LOGI(LOG_TAG, "Fallback key derivation completed");
 	
-#ifdef CONFIG_MBEDTLS_SHA256_C	
+#ifdef CONFIG_MBEDTLS_SHA512_C	
 key_derivation_done:
 #endif
 
