@@ -407,9 +407,13 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
 		esp_ble_gatts_send_response(gatts_if, param->read.conn_id, param->read.trans_id, ESP_GATT_OK, &rsp);
 		break; }
 	case ESP_GATTS_WRITE_EVT:
+		ESP_LOGI(LOG_TAG, "GATT write conn_id=%d handle=%d len=%d",
+				 param->write.conn_id, param->write.handle, param->write.len);
 		if (param->write.handle == gatt_handle_table[IDX_CHAR_RW_VAL]) {
 			/* Process challenge write (LwM2MDeviceChallenge) */
 			ble_lwm2m_process_challenge_write(param->write.conn_id, param->write.value, param->write.len);
+		} else {
+			ESP_LOGW(LOG_TAG, "Write to unknown handle %d", param->write.handle);
 		}
 		if (param->write.need_rsp) {
 			esp_gatt_rsp_t rsp = {0};
@@ -679,6 +683,11 @@ static void ble_lwm2m_process_challenge_write(uint16_t conn_id, const uint8_t *d
 		ESP_LOGE(LOG_TAG, "Challenge public key size invalid (%u)", (unsigned)challenge.public_key.size);
 		return;
 	}
+	ESP_LOGI(LOG_TAG, "Challenge: nounce=0x%08x pubkey_len=%ld",
+				(unsigned)challenge.nounce, (long)challenge.public_key.size);
+	/* Dump public_key in hex at DEBUG level */
+	ESP_LOG_BUFFER_HEX_LEVEL(LOG_TAG, challenge.public_key.bytes,
+							 challenge.public_key.size, ESP_LOG_INFO);
 	const uint8_t *peer_pub = challenge.public_key.bytes;
 	const uint8_t *our_priv = s_factory_partition->private_key.bytes; /* 32 bytes */
 	uint8_t shared[32] = {0};
