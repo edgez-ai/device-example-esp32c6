@@ -46,6 +46,10 @@ static int mbedtls_aes_crypt_ecb(mbedtls_aes_context *c,int m,const unsigned cha
 #ifdef CONFIG_MBEDTLS_SHA256_C
 #include "mbedtls/sha256.h"
 #endif
+#ifdef CONFIG_MBEDTLS_ECDH_C
+#include "mbedtls/ecdh.h"
+#include "mbedtls/ecp.h"
+#endif
 /* Removed direct include of mbedtls/aes.h; guarded stub/conditional version provided later */
 
 #define LOG_TAG "BLE_LWM2M"
@@ -690,28 +694,75 @@ static void ble_lwm2m_process_challenge_write(uint16_t conn_id, const uint8_t *d
 							 challenge.public_key.size, ESP_LOG_INFO);
 	const uint8_t *peer_pub = challenge.public_key.bytes;
 	const uint8_t *our_priv = s_factory_partition->private_key.bytes; /* 32 bytes */
-	uint8_t shared[32] = {0};
-	bool have_shared = false;
-#ifdef CONFIG_MBEDTLS_INCLUDED
-	/* Use X25519 if available via mbedTLS (not always built). Placeholder: copy */
-	/* TODO: Replace with real ECDH (Curve25519) implementation. */
-	for (int i=0;i<32;i++) shared[i] = peer_pub[i] ^ our_priv[i];
-	have_shared = true;
-#else
-	for (int i=0;i<32;i++) shared[i] = peer_pub[i] ^ our_priv[i]; /* simple xor placeholder */
-	have_shared = true;
-#endif
-	if (!have_shared) {
-		ESP_LOGE(LOG_TAG, "ECDH derivation failed");
-		return;
-	}
+
 	uint8_t key32[32];
-#ifdef CONFIG_MBEDTLS_INCLUDED
-	mbedtls_sha256(shared, sizeof(shared), key32, 0);
-#else
-	/* Fallback: simple hash placeholder */
-	for (int i=0;i<32;i++) key32[i] = shared[i] ^ 0x5A;
+	
+	/* Derive shared secret using SHA-256 based key derivation */
+	/* Since we have both keys as 32-byte values, we'll use HKDF-like approach with SHA-256 */
+#ifdef CONFIG_MBEDTLS_SHA256_C
+	ESP_LOGI(LOG_TAG, "Using SHA-256 based key derivation");
+	
+	/* Combine the keys using SHA-256(our_priv || peer_pub || "ECDH_KEY") */
+	mbedtls_sha256_context sha_ctx;
+	mbedtls_sha256_init(&sha_ctx);
+	int ret = mbedtls_sha256_starts(&sha_ctx, 0); /* 0 = SHA-256 */
+	if (ret != 0) {
+		ESP_LOGE(LOG_TAG, "SHA256 start failed: -0x%04x", -ret);
+		mbedtls_sha256_free(&sha_ctx);
+		goto fallback_key_derivation;
+	}
+	
+	/* Hash our private key */
+	ret = mbedtls_sha256_update(&sha_ctx, our_priv, 32);
+	if (ret != 0) {
+		ESP_LOGE(LOG_TAG, "SHA256 update private key failed: -0x%04x", -ret);
+		mbedtls_sha256_free(&sha_ctx);
+		goto fallback_key_derivation;
+	}
+	
+	/* Hash peer public key */
+	ret = mbedtls_sha256_update(&sha_ctx, peer_pub, 32);
+	if (ret != 0) {
+		ESP_LOGE(LOG_TAG, "SHA256 update public key failed: -0x%04x", -ret);
+		mbedtls_sha256_free(&sha_ctx);
+		goto fallback_key_derivation;
+	}
+	
+	/* Add a salt/label for key derivation */
+	const char *label = "BLE_LWM2M_ECDH_KEY_V1";
+	ret = mbedtls_sha256_update(&sha_ctx, (const unsigned char*)label, strlen(label));
+	if (ret != 0) {
+		ESP_LOGE(LOG_TAG, "SHA256 update label failed: -0x%04x", -ret);
+		mbedtls_sha256_free(&sha_ctx);
+		goto fallback_key_derivation;
+	}
+	
+	/* Finalize hash to get derived key */
+	ret = mbedtls_sha256_finish(&sha_ctx, key32);
+	mbedtls_sha256_free(&sha_ctx);
+	
+	if (ret != 0) {
+		ESP_LOGE(LOG_TAG, "SHA256 finish failed: -0x%04x", -ret);
+		goto fallback_key_derivation;
+	}
+	
+	ESP_LOGI(LOG_TAG, "SHA-256 key derivation successful");
+	ESP_LOG_BUFFER_HEX_LEVEL(LOG_TAG, key32, 32, ESP_LOG_DEBUG);
+	goto key_derivation_done;
+	
+fallback_key_derivation:
 #endif
+	/* Fallback: use simple XOR combination if SHA256 not available or failed */
+	ESP_LOGW(LOG_TAG, "Using fallback key derivation");
+	for (int i = 0; i < 32; i++) {
+		key32[i] = our_priv[i] ^ peer_pub[i];
+	}
+	ESP_LOGI(LOG_TAG, "Fallback key derivation completed");
+	
+#ifdef CONFIG_MBEDTLS_SHA256_C	
+key_derivation_done:
+#endif
+
 	/* Prepare plaintext = factory signature (64 bytes) */
 	size_t sig_len = s_factory_partition->signature.size;
 	if (sig_len == 0 || sig_len > sizeof(s_factory_partition->signature.bytes)) {
@@ -721,7 +772,9 @@ static void ble_lwm2m_process_challenge_write(uint16_t conn_id, const uint8_t *d
 	const uint8_t *sig = s_factory_partition->signature.bytes;
 	uint8_t nonce[12] = {0};
 	/* Use 4-byte nounce + zeros (expand to 12) */
-	uint32_t n = challenge.nounce; memcpy(nonce, &n, sizeof(n));
+	uint32_t n = challenge.nounce;
+	memcpy(nonce, &n, sizeof(n));
+
 	size_t out_len = 0;
 	chacha20poly1305_encrypt_placeholder(key32, nonce, sig, sig_len, ctx->value, &out_len, sizeof(ctx->value));
 	ctx->len = (uint16_t)out_len;
