@@ -902,13 +902,46 @@ key_derivation_done:
 	}
 	const uint8_t *sig = s_factory_partition->signature.bytes;
 
-	size_t out_len = 0;
-	if (chacha20poly1305_encrypt(key32, challenge.nounce, sig, sig_len, ctx->value, &out_len, sizeof(ctx->value))) {
-		ctx->len = (uint16_t)out_len;
-		ESP_LOGI(LOG_TAG, "Processed challenge for conn %u: sig_len=%u enc_len=%u", 
-				 (unsigned)conn_id, (unsigned)sig_len, (unsigned)out_len);
-	} else {
+	/* Encrypt the signature using ChaCha20-Poly1305 */
+	uint8_t encrypted_sig[128]; /* Buffer for encrypted signature */
+	size_t enc_sig_len = 0;
+	if (!chacha20poly1305_encrypt(key32, challenge.nounce, sig, sig_len, encrypted_sig, &enc_sig_len, sizeof(encrypted_sig))) {
 		ESP_LOGE(LOG_TAG, "Challenge encryption failed for conn %u", (unsigned)conn_id);
+		ctx->len = 0;
+		return;
+	}
+
+	/* Create LwM2MDeviceChallengeAnswer protobuf message */
+	lwm2m_LwM2MDeviceChallengeAnswer answer = lwm2m_LwM2MDeviceChallengeAnswer_init_zero;
+	
+	/* Set the factory partition public key */
+	if (s_factory_partition->public_key.size > 0 && s_factory_partition->public_key.size <= sizeof(answer.public_key.bytes)) {
+		answer.public_key.size = s_factory_partition->public_key.size;
+		memcpy(answer.public_key.bytes, s_factory_partition->public_key.bytes, answer.public_key.size);
+	} else {
+		ESP_LOGE(LOG_TAG, "Invalid factory public key size: %u", (unsigned)s_factory_partition->public_key.size);
+		ctx->len = 0;
+		return;
+	}
+	
+	/* Set the encrypted signature */
+	if (enc_sig_len <= sizeof(answer.signature.bytes)) {
+		answer.signature.size = enc_sig_len;
+		memcpy(answer.signature.bytes, encrypted_sig, enc_sig_len);
+	} else {
+		ESP_LOGE(LOG_TAG, "Encrypted signature too large: %u", (unsigned)enc_sig_len);
+		ctx->len = 0;
+		return;
+	}
+
+	/* Encode the protobuf message into ctx->value */
+	pb_ostream_t ostream = pb_ostream_from_buffer(ctx->value, sizeof(ctx->value));
+	if (pb_encode(&ostream, lwm2m_LwM2MDeviceChallengeAnswer_fields, &answer)) {
+		ctx->len = (uint16_t)ostream.bytes_written;
+		ESP_LOGI(LOG_TAG, "Challenge answer created for conn %u: pub_key_len=%u enc_sig_len=%u total_len=%u", 
+				 (unsigned)conn_id, (unsigned)answer.public_key.size, (unsigned)enc_sig_len, (unsigned)ctx->len);
+	} else {
+		ESP_LOGE(LOG_TAG, "Failed to encode challenge answer protobuf for conn %u", (unsigned)conn_id);
 		ctx->len = 0;
 	}
 }
