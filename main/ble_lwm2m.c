@@ -31,6 +31,7 @@
 #include "lwm2m.pb.h"
 #include "pb_encode.h"
 #include "pb_decode.h"
+#include "lwm2m_helpers.h"
 
 /* Conditional minimal crypto support: provide stubs if mbedTLS components not enabled. */
 #ifdef CONFIG_MBEDTLS_AES_C
@@ -43,16 +44,7 @@ static int mbedtls_aes_setkey_enc(mbedtls_aes_context *c,const unsigned char *k,
 static int mbedtls_aes_crypt_ecb(mbedtls_aes_context *c,int m,const unsigned char in[16],unsigned char out[16]){(void)c;(void)m;memcpy(out,in,16);return 0;} 
 #define MBEDTLS_AES_ENCRYPT 1
 #endif
-#ifdef CONFIG_MBEDTLS_SHA512_C
-#include "mbedtls/sha512.h"
-#endif
-#ifdef CONFIG_MBEDTLS_ECDH_C
-#include "mbedtls/ecdh.h"
-#include "mbedtls/ecp.h"
-#endif
 #if defined(CONFIG_MBEDTLS_CHACHA20_C) && defined(CONFIG_MBEDTLS_POLY1305_C)
-#include "mbedtls/chacha20.h"
-#include "mbedtls/poly1305.h"
 #define HAS_CHACHA20_POLY1305 1
 #else
 #define HAS_CHACHA20_POLY1305 0
@@ -668,107 +660,28 @@ static bool chacha20poly1305_encrypt(const uint8_t *key32, const uint32_t nonce3
 
 #if HAS_CHACHA20_POLY1305
 	ESP_LOGI(LOG_TAG, "Using ChaCha20-Poly1305 AEAD encryption");
-	
-	/* Construct 12-byte nonce: 8 bytes zeros + 4 bytes from challenge nonce */
-	uint8_t nonce12[12] = {0};
-	/* Place the 32-bit nonce in little-endian at offset 8 */
-	nonce12[8] = (nonce32 >> 0) & 0xFF;
-	nonce12[9] = (nonce32 >> 8) & 0xFF;
-	nonce12[10] = (nonce32 >> 16) & 0xFF;
-	nonce12[11] = (nonce32 >> 24) & 0xFF;
-	
-	ESP_LOG_BUFFER_HEX_LEVEL(LOG_TAG, nonce12, 12, ESP_LOG_DEBUG);
-	
-	/* Initialize ChaCha20 context */
-	mbedtls_chacha20_context chacha_ctx;
-	mbedtls_chacha20_init(&chacha_ctx);
-	
-	int ret = mbedtls_chacha20_setkey(&chacha_ctx, key32);
+
+    uint8_t nonce12[12] = {0};
+    char nonce_str[13];
+    snprintf(nonce_str, sizeof(nonce_str), "%012" PRIu32, nonce32);
+    memcpy(nonce12, nonce_str, sizeof(nonce12));
+
+	ESP_LOG_BUFFER_HEX_LEVEL(LOG_TAG, nonce12, sizeof(nonce12), ESP_LOG_DEBUG);
+
+	uint8_t tag[16];
+	int ret = lwm2m_chacha20_poly1305_encrypt(key32, nonce12,
+											 in, in_len,
+											 NULL, 0,
+											 out, tag);
 	if (ret != 0) {
-		ESP_LOGE(LOG_TAG, "ChaCha20 setkey failed: -0x%04x", -ret);
-		mbedtls_chacha20_free(&chacha_ctx);
+		ESP_LOGE(LOG_TAG, "ChaCha20-Poly1305 helper failed: %d", ret);
 		return false;
 	}
-	
-	ret = mbedtls_chacha20_starts(&chacha_ctx, nonce12, 1); /* counter starts at 1 for AEAD */
-	if (ret != 0) {
-		ESP_LOGE(LOG_TAG, "ChaCha20 starts failed: -0x%04x", -ret);
-		mbedtls_chacha20_free(&chacha_ctx);
-		return false;
-	}
-	
-	/* Encrypt the plaintext */
-	ret = mbedtls_chacha20_update(&chacha_ctx, in_len, in, out);
-	if (ret != 0) {
-		ESP_LOGE(LOG_TAG, "ChaCha20 encrypt failed: -0x%04x", -ret);
-		mbedtls_chacha20_free(&chacha_ctx);
-		return false;
-	}
-	
-	mbedtls_chacha20_free(&chacha_ctx);
-	
-	/* Generate Poly1305 authentication tag */
-	mbedtls_poly1305_context poly_ctx;
-	mbedtls_poly1305_init(&poly_ctx);
-	
-	/* Derive Poly1305 key from ChaCha20 with counter 0 */
-	uint8_t poly_key[32];
-	mbedtls_chacha20_init(&chacha_ctx);
-	ret = mbedtls_chacha20_setkey(&chacha_ctx, key32);
-	if (ret != 0) {
-		ESP_LOGE(LOG_TAG, "ChaCha20 setkey for Poly1305 key failed: -0x%04x", -ret);
-		mbedtls_chacha20_free(&chacha_ctx);
-		mbedtls_poly1305_free(&poly_ctx);
-		return false;
-	}
-	
-	ret = mbedtls_chacha20_starts(&chacha_ctx, nonce12, 0); /* counter 0 for Poly1305 key */
-	if (ret != 0) {
-		ESP_LOGE(LOG_TAG, "ChaCha20 starts for Poly1305 key failed: -0x%04x", -ret);
-		mbedtls_chacha20_free(&chacha_ctx);
-		mbedtls_poly1305_free(&poly_ctx);
-		return false;
-	}
-	
-	memset(poly_key, 0, 32);
-	ret = mbedtls_chacha20_update(&chacha_ctx, 32, poly_key, poly_key);
-	if (ret != 0) {
-		ESP_LOGE(LOG_TAG, "ChaCha20 Poly1305 key generation failed: -0x%04x", -ret);
-		mbedtls_chacha20_free(&chacha_ctx);
-		mbedtls_poly1305_free(&poly_ctx);
-		return false;
-	}
-	
-	mbedtls_chacha20_free(&chacha_ctx);
-	
-	/* Initialize Poly1305 with the derived key */
-	ret = mbedtls_poly1305_starts(&poly_ctx, poly_key);
-	if (ret != 0) {
-		ESP_LOGE(LOG_TAG, "Poly1305 starts failed: -0x%04x", -ret);
-		mbedtls_poly1305_free(&poly_ctx);
-		return false;
-	}
-	
-	/* No additional authenticated data (AAD) in this implementation */
-	/* Authenticate the ciphertext */
-	ret = mbedtls_poly1305_update(&poly_ctx, out, in_len);
-	if (ret != 0) {
-		ESP_LOGE(LOG_TAG, "Poly1305 update failed: -0x%04x", -ret);
-		mbedtls_poly1305_free(&poly_ctx);
-		return false;
-	}
-	
-	/* Finalize and get the authentication tag */
-	ret = mbedtls_poly1305_finish(&poly_ctx, &out[in_len]);
-	mbedtls_poly1305_free(&poly_ctx);
-	
-	if (ret != 0) {
-		ESP_LOGE(LOG_TAG, "Poly1305 finish failed: -0x%04x", -ret);
-		return false;
-	}
-	
-	*out_len = in_len + 16; /* ciphertext + 16-byte tag */
-	ESP_LOGI(LOG_TAG, "ChaCha20-Poly1305 encryption successful: %u->%u bytes", 
+
+	memcpy(&out[in_len], tag, sizeof(tag));
+	memset(tag, 0, sizeof(tag));
+	*out_len = in_len + sizeof(tag);
+	ESP_LOGI(LOG_TAG, "ChaCha20-Poly1305 encryption successful: %u->%u bytes",
 			 (unsigned)in_len, (unsigned)*out_len);
 	return true;
 	
@@ -821,78 +734,35 @@ static void ble_lwm2m_process_challenge_write(uint16_t conn_id, const uint8_t *d
 							 challenge.public_key.size, ESP_LOG_INFO);
 	const uint8_t *peer_pub = challenge.public_key.bytes;
 	const uint8_t *our_priv = s_factory_partition->private_key.bytes; /* 32 bytes */
+	const uint8_t *factory_pub = s_factory_partition->public_key.bytes;
+	size_t factory_pub_len = s_factory_partition->public_key.size;
+	uint8_t shared_key[32];
+	uint8_t derived_public[32];
 
-	uint8_t key32[32];
-	
-	/* Derive shared secret using SHA-512 based key derivation */
-	/* Since we have both keys as 32-byte values, we'll use HKDF-like approach with SHA-512 */
-#ifdef CONFIG_MBEDTLS_SHA512_C
-	ESP_LOGI(LOG_TAG, "Using SHA-512 based key derivation");
-	
-	/* Combine the keys using SHA-512(our_priv || peer_pub || "ECDH_KEY") */
-	mbedtls_sha512_context sha_ctx;
-	mbedtls_sha512_init(&sha_ctx);
-	int ret = mbedtls_sha512_starts(&sha_ctx, 0); /* 0 = SHA-512 (not SHA-384) */
+	if (s_factory_partition->private_key.size != sizeof(shared_key)) {
+		ESP_LOGE(LOG_TAG, "Factory private key size invalid: %u", (unsigned)s_factory_partition->private_key.size);
+		return;
+	}
+
+	int ret = lwm2m_crypto_curve25519_shared_key(peer_pub, our_priv, shared_key);
 	if (ret != 0) {
-		ESP_LOGE(LOG_TAG, "SHA512 start failed: -0x%04x", -ret);
-		mbedtls_sha512_free(&sha_ctx);
-		goto fallback_key_derivation;
+		ESP_LOGE(LOG_TAG, "Curve25519 shared key derivation failed: %d", ret);
+		return;
 	}
-	
-	/* Hash our private key */
-	ret = mbedtls_sha512_update(&sha_ctx, our_priv, 32);
-	if (ret != 0) {
-		ESP_LOGE(LOG_TAG, "SHA512 update private key failed: -0x%04x", -ret);
-		mbedtls_sha512_free(&sha_ctx);
-		goto fallback_key_derivation;
+	ESP_LOGI(LOG_TAG, "Curve25519 shared key derived for conn %u", (unsigned)conn_id);
+	ESP_LOG_BUFFER_HEX_LEVEL(LOG_TAG, shared_key, sizeof(shared_key), ESP_LOG_DEBUG);
+
+	ret = lwm2m_curve25519_public_from_private(our_priv, derived_public);
+	if (ret == 0) {
+		if (factory_pub_len != sizeof(derived_public) ||
+		    memcmp(factory_pub, derived_public, sizeof(derived_public)) != 0) {
+			ESP_LOGW(LOG_TAG, "Factory public key mismatch; using recomputed value");
+			factory_pub = derived_public;
+			factory_pub_len = sizeof(derived_public);
+		}
+	} else {
+		ESP_LOGW(LOG_TAG, "Unable to derive public key from factory private key (code=%d)", ret);
 	}
-	
-	/* Hash peer public key */
-	ret = mbedtls_sha512_update(&sha_ctx, peer_pub, 32);
-	if (ret != 0) {
-		ESP_LOGE(LOG_TAG, "SHA512 update public key failed: -0x%04x", -ret);
-		mbedtls_sha512_free(&sha_ctx);
-		goto fallback_key_derivation;
-	}
-	
-	/* Add a salt/label for key derivation */
-	const char *label = "BLE_LWM2M_ECDH_KEY_V1";
-	ret = mbedtls_sha512_update(&sha_ctx, (const unsigned char*)label, strlen(label));
-	if (ret != 0) {
-		ESP_LOGE(LOG_TAG, "SHA512 update label failed: -0x%04x", -ret);
-		mbedtls_sha512_free(&sha_ctx);
-		goto fallback_key_derivation;
-	}
-	
-	/* Finalize hash to get derived key - SHA-512 produces 64 bytes, truncate to 32 */
-	uint8_t sha512_output[64];
-	ret = mbedtls_sha512_finish(&sha_ctx, sha512_output);
-	mbedtls_sha512_free(&sha_ctx);
-	
-	if (ret != 0) {
-		ESP_LOGE(LOG_TAG, "SHA512 finish failed: -0x%04x", -ret);
-		goto fallback_key_derivation;
-	}
-	
-	/* Use first 32 bytes of SHA-512 output as the derived key */
-	memcpy(key32, sha512_output, 32);
-	
-	ESP_LOGI(LOG_TAG, "SHA-512 key derivation successful");
-	ESP_LOG_BUFFER_HEX_LEVEL(LOG_TAG, key32, 32, ESP_LOG_DEBUG);
-	goto key_derivation_done;
-	
-fallback_key_derivation:
-#endif
-	/* Fallback: use simple XOR combination if SHA512 not available or failed */
-	ESP_LOGW(LOG_TAG, "Using fallback key derivation");
-	for (int i = 0; i < 32; i++) {
-		key32[i] = our_priv[i] ^ peer_pub[i];
-	}
-	ESP_LOGI(LOG_TAG, "Fallback key derivation completed");
-	
-#ifdef CONFIG_MBEDTLS_SHA512_C	
-key_derivation_done:
-#endif
 
 	/* Prepare plaintext = factory signature (64 bytes) */
 	size_t sig_len = s_factory_partition->signature.size;
@@ -905,7 +775,7 @@ key_derivation_done:
 	/* Encrypt the signature using ChaCha20-Poly1305 */
 	uint8_t encrypted_sig[128]; /* Buffer for encrypted signature */
 	size_t enc_sig_len = 0;
-	if (!chacha20poly1305_encrypt(key32, challenge.nounce, sig, sig_len, encrypted_sig, &enc_sig_len, sizeof(encrypted_sig))) {
+	if (!chacha20poly1305_encrypt(shared_key, challenge.nounce, sig, sig_len, encrypted_sig, &enc_sig_len, sizeof(encrypted_sig))) {
 		ESP_LOGE(LOG_TAG, "Challenge encryption failed for conn %u", (unsigned)conn_id);
 		ctx->len = 0;
 		return;
@@ -915,11 +785,11 @@ key_derivation_done:
 	lwm2m_LwM2MDeviceChallengeAnswer answer = lwm2m_LwM2MDeviceChallengeAnswer_init_zero;
 	
 	/* Set the factory partition public key */
-	if (s_factory_partition->public_key.size > 0 && s_factory_partition->public_key.size <= sizeof(answer.public_key.bytes)) {
-		answer.public_key.size = s_factory_partition->public_key.size;
-		memcpy(answer.public_key.bytes, s_factory_partition->public_key.bytes, answer.public_key.size);
+	if (factory_pub_len > 0 && factory_pub_len <= sizeof(answer.public_key.bytes)) {
+		answer.public_key.size = factory_pub_len;
+		memcpy(answer.public_key.bytes, factory_pub, factory_pub_len);
 	} else {
-		ESP_LOGE(LOG_TAG, "Invalid factory public key size: %u", (unsigned)s_factory_partition->public_key.size);
+		ESP_LOGE(LOG_TAG, "Invalid factory public key size: %u", (unsigned)factory_pub_len);
 		ctx->len = 0;
 		return;
 	}
