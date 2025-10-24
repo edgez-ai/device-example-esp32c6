@@ -13,6 +13,16 @@ dependencies:
     source:
       type: idf
     version: 5.5.1
+  jgromes/radiolib:
+    component_hash: f374082c6e1e5407e35b4462f4fe6fbba25b88424afdd01aa2548c93ca168f79
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=4.1'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 7.3.0
   nikas-belogolov/nanopb:
     component_hash: f87bec16ffb47d5ceb557b7f13acb83cad95046ab155d1af33e488d1b048fddc
     dependencies:
@@ -25,7 +35,9 @@ dependencies:
     version: 1.0.0
 direct_dependencies:
 - espressif/libsodium
+- idf
+- jgromes/radiolib
 - nikas-belogolov/nanopb
-manifest_hash: 1dd788af0c80dbd2d81a366de167e6c23406c060bdfa995b9ed4ec468c8eceee
-target: esp32c6
+manifest_hash: 7cff87973a9791e817685e9184de3fd125ba0b0a197357b95ba4508ea118526a
+target: esp32s3
 version: 2.0.0
