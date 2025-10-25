@@ -135,6 +135,9 @@ class EspHal : public RadioLibHal {
       spiSCK(sck), spiMISO(miso), spiMOSI(mosi)  {
     }
 
+    // virtual destructor to properly handle polymorphic deletion
+    virtual ~EspHal() = default;
+
     void init() override {
       // we only need to init the SPI here
       spiBegin();

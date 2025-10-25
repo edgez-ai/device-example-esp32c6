@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <inttypes.h>
 #include <string.h>
+#include <stdlib.h>
 #include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -21,6 +22,8 @@
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "ble_lwm2m.h"
+/* LoRa functionality */
+#include "lora.h"
 
 static const char *TAG = "main";
 
@@ -30,6 +33,47 @@ static const char *TAG = "main";
 static lwm2m_FactoryPartition g_factory_partition = {0};
 static bool g_factory_partition_valid = false;
 static bool g_aes_key_exists = false;
+
+/* LoRa receive callback function */
+void lora_message_received(const uint8_t* data, size_t length, float rssi, float snr) {
+    ESP_LOGI(TAG, "🎯 LoRa message callback triggered!");
+    ESP_LOGI(TAG, "   Length: %d bytes", length);
+    ESP_LOGI(TAG, "   RSSI: %.2f dBm", rssi);
+    ESP_LOGI(TAG, "   SNR: %.2f dB", snr);
+    
+    // Print as hex for binary data
+    ESP_LOG_BUFFER_HEX_LEVEL(TAG, data, length, ESP_LOG_INFO);
+    
+    // Try to print as string if it appears to be text
+    bool is_printable = true;
+    for (size_t i = 0; i < length; i++) {
+        if (data[i] < 32 && data[i] != '\0' && data[i] != '\n' && data[i] != '\r') {
+            is_printable = false;
+            break;
+        }
+    }
+    
+    if (is_printable && length > 0) {
+        char* str_copy = malloc(length + 1);
+        if (str_copy) {
+            memcpy(str_copy, data, length);
+            str_copy[length] = '\0';
+            ESP_LOGI(TAG, "   Text: %s", str_copy);
+            free(str_copy);
+        }
+    }
+    
+    // Signal quality assessment
+    if (rssi > -80) {
+        ESP_LOGI(TAG, "   Signal quality: Excellent");
+    } else if (rssi > -100) {
+        ESP_LOGI(TAG, "   Signal quality: Good");
+    } else if (rssi > -120) {
+        ESP_LOGI(TAG, "   Signal quality: Fair");
+    } else {
+        ESP_LOGI(TAG, "   Signal quality: Poor");
+    }
+}
 
 
 void app_main(void)
@@ -118,9 +162,38 @@ void app_main(void)
     ESP_LOGI(TAG, "LwM2M BLE Device initialized successfully");
     ESP_LOGI(TAG, "Broadcasting will begin in %d seconds...", BROADCAST_INTERVAL_MS / 1000);
 
-    // Main loop - just keep the system running
+    /* Initialize and start LoRa module with listen-before-send pattern */
+    ESP_LOGI(TAG, "Initializing LoRa module for ESP32-C6...");
+    esp_err_t lora_ret = lora_init();
+    if (lora_ret != ESP_OK) {
+        ESP_LOGE(TAG, "LoRa init failed: %s", esp_err_to_name(lora_ret));
+    } else {
+        lora_ret = lora_start_task(lora_message_received);
+        if (lora_ret != ESP_OK) {
+            ESP_LOGE(TAG, "LoRa task start failed: %s", esp_err_to_name(lora_ret));
+        } else {
+            ESP_LOGI(TAG, "LoRa module initialized and task started successfully");
+            ESP_LOGI(TAG, "🎯 LoRa is now listening with callback support");
+            
+            // Send a test message after a short delay to demonstrate the functionality
+            vTaskDelay(pdMS_TO_TICKS(2000)); // 2 second delay
+            lora_send_message("Hello from ESP32-C6 Device! 🚀");
+        }
+    }
+
+    // Main loop - keep the system running and send periodic LoRa messages
+    int message_counter = 0;
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(5000));
         ESP_LOGI(TAG, "System running... Free heap: %" PRIu32 " bytes", esp_get_free_heap_size());
+        
+        // Send periodic LoRa status message every 30 seconds
+        message_counter++;
+        if (message_counter % 6 == 0) { // Every 30 seconds (6 * 5 seconds)
+            char status_msg[128];
+            snprintf(status_msg, sizeof(status_msg), "ESP32-C6 Status #%d - Heap: %lu bytes", 
+                    message_counter / 6, esp_get_free_heap_size());
+            lora_send_message(status_msg);
+        }
     }
 }
